@@ -1,0 +1,30 @@
+# Secrets
+.env
+
+# Python
+venv/
+venv_bot/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Runtime data
+logs/
+data/
+*.db
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backups
+*.bak
+*.backup
