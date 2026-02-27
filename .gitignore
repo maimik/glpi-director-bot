@@ -28,3 +28,7 @@ Thumbs.db
 # Backups
 *.bak
 *.backup
+
+# Local config
+director-bot.init
+.claude/

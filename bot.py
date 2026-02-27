@@ -64,6 +64,8 @@ class GLPIClient:
         }
         # Память для отправленных уведомлений о валидациях
         self.notified_validations = set()
+        # Ticket IDs, уведомлённые через согласования (для дедупликации)
+        self.notified_ticket_ids = set()
 
     async def init_session(self):
         """Авторизация и переключение в режим Global View"""
@@ -604,8 +606,14 @@ class GLPIClient:
             logger.error(f"Update validation error: {e}")
             return False
 
-    async def create_ticket(self, title, content):
-        """Создание тикета с корректным указанием автора и локации"""
+    async def create_ticket(self, title, content, ticket_type=2):
+        """Создание тикета с корректным указанием автора, локации и наблюдателя
+        
+        Args:
+            title: Заголовок тикета
+            content: Описание тикета
+            ticket_type: Тип заявки (1=Инцидент, 2=Запрос). По умолчанию Запрос.
+        """
         if not self.session_token:
             await self.init_session()
         
@@ -619,10 +627,11 @@ class GLPIClient:
                 "content": content,
                 "status": 1,  # New
                 "priority": 3,
-                "type": 2,  # Request
+                "type": ticket_type,  # 1=Incident, 2=Request
                 "entities_id": 0,  # Root entity для видимости везде
                 "locations_id": locations_id,  # Локация из профиля пользователя
-                "_users_id_requester": [Config.GLPI_MY_ID]  # Связать как Requester (с underscore!)
+                "_users_id_requester": [Config.GLPI_MY_ID],  # Связать как Requester
+                "_groups_id_observer": [1]  # Группа Administrators как наблюдатель
             }
         }
         
@@ -664,7 +673,9 @@ def init_db():
 # === STATES ===
 class Form(StatesGroup):
     waiting_for_refusal = State()
+    waiting_for_ticket_type = State()
     waiting_for_ticket_title = State()
+    waiting_for_ticket_desc = State()
 
 # === BOT SETUP ===
 bot = Bot(token=Config.BOT_TOKEN)
@@ -674,16 +685,25 @@ glpi = GLPIClient()
 
 # === HANDLERS ===
 
-@router.message(CommandStart())
-async def cmd_start(message: Message):
-    if message.from_user.id != Config.ADMIN_ID: return
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+def get_main_menu_kb():
+    """Клавиатура главного меню"""
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Проверить согласования", callback_data="check_validations")],
         [InlineKeyboardButton(text="📂 Мои заявки", callback_data="my_tickets")],
         [InlineKeyboardButton(text="➕ Создать заявку", callback_data="create_ticket")]
     ])
-    await message.answer(f"👋 Добрый день! Я готов к работе.\n\nGLPI ID: {Config.GLPI_MY_ID}", reply_markup=kb)
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext):
+    if message.from_user.id != Config.ADMIN_ID: return
+    await state.clear()
+    await message.answer(f"👋 Добрый день! Я готов к работе.\n\nGLPI ID: {Config.GLPI_MY_ID}", reply_markup=get_main_menu_kb())
+
+@router.callback_query(F.data == "main_menu")
+async def callback_main_menu(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.clear()
+    await call.message.answer("🏠 Главное меню", reply_markup=get_main_menu_kb())
 
 @router.message(Command("approvals"))
 async def cmd_approvals(message: Message):
@@ -757,7 +777,8 @@ async def cmd_approvals(message: Message):
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="check_validations")]
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="check_validations")],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
     ])
 
     msg = chr(10).join(lines)
@@ -814,7 +835,8 @@ async def cmd_my_tickets(message: Message):
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="my_tickets")],
-        [InlineKeyboardButton(text="🔗 Открыть GLPI", url=f"{Config.GLPI_URL}/front/ticket.php")]
+        [InlineKeyboardButton(text="🔗 Открыть GLPI", url=f"{Config.GLPI_URL}/front/ticket.php")],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
     ])
 
     msg = chr(10).join(lines)
@@ -930,7 +952,8 @@ async def manual_check(call: CallbackQuery):
         lines.append(f"<i>...и ещё {remaining} согласований</i>")
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Обновить", callback_data="check_validations")]
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="check_validations")],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
     ])
     
     msg = chr(10).join(lines)
@@ -990,7 +1013,8 @@ async def my_tickets_handler(call: CallbackQuery):
     # Кнопки
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Обновить", callback_data="my_tickets")],
-        [InlineKeyboardButton(text="🔗 Открыть GLPI", url=f"{Config.GLPI_URL}/front/ticket.php")]
+        [InlineKeyboardButton(text="🔗 Открыть GLPI", url=f"{Config.GLPI_URL}/front/ticket.php")],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
     ])
     
     msg = chr(10).join(lines)
@@ -999,19 +1023,54 @@ async def my_tickets_handler(call: CallbackQuery):
 @router.callback_query(F.data == "create_ticket")
 async def start_create_ticket(call: CallbackQuery, state: FSMContext):
     await call.answer()
-    await call.message.answer("📝 Напишите краткую суть заявки (заголовок):")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📋 Запрос", callback_data="ticket_type_2"),
+            InlineKeyboardButton(text="🔥 Инцидент", callback_data="ticket_type_1")
+        ]
+    ])
+    await call.message.answer("📝 Выберите тип заявки:", reply_markup=kb)
+    await state.set_state(Form.waiting_for_ticket_type)
+
+@router.callback_query(Form.waiting_for_ticket_type, F.data.startswith("ticket_type_"))
+async def process_ticket_type(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    ticket_type = int(call.data.split("_")[-1])  # 1=Инцидент, 2=Запрос
+    type_name = "Инцидент" if ticket_type == 1 else "Запрос"
+    await state.update_data(ticket_type=ticket_type)
+    await call.message.edit_text(f"✅ Тип: {type_name}\n\n📝 Напишите краткую суть заявки (заголовок):")
     await state.set_state(Form.waiting_for_ticket_title)
 
 @router.message(Form.waiting_for_ticket_title)
 async def process_ticket_title(message: Message, state: FSMContext):
-    title = message.text
-    # Тут можно добавить шаг с описанием, но для директора сделаем быстро - title и есть description
-    ticket_id = await glpi.create_ticket(title, title)
+    await state.update_data(ticket_title=message.text)
+    await message.answer("📄 Теперь опишите заявку подробнее (содержание):")
+    await state.set_state(Form.waiting_for_ticket_desc)
+
+@router.message(Form.waiting_for_ticket_desc)
+async def process_ticket_desc(message: Message, state: FSMContext):
+    data = await state.get_data()
+    title = data.get("ticket_title", "")
+    content = message.text
+    ticket_type = data.get("ticket_type", 2)
+    type_name = "Инцидент" if ticket_type == 1 else "Запрос"
+    
+    ticket_id = await glpi.create_ticket(title, content, ticket_type=ticket_type)
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
+    ])
     
     if ticket_id:
-        await message.answer(f"✅ Заявка #{ticket_id} успешно создана!\n\n🔗 {Config.GLPI_URL}/front/ticket.form.php?id={ticket_id}")
+        await message.answer(
+            f"✅ Заявка #{ticket_id} создана!\n"
+            f"📋 Тип: {type_name}\n"
+            f"👀 Наблюдатель: Administrators\n\n"
+            f"🔗 {Config.GLPI_URL}/front/ticket.form.php?id={ticket_id}",
+            reply_markup=kb
+        )
     else:
-        await message.answer("❌ Ошибка при создании заявки.")
+        await message.answer("❌ Ошибка при создании заявки.", reply_markup=kb)
     await state.clear()
 
 # --- VALIDATION LOGIC ---
@@ -1035,10 +1094,14 @@ async def approve_handler(call: CallbackQuery):
         await call.message.edit_reply_markup(reply_markup=None)
         # Привязываем ответ к карточке тикета
         ticket_ref = f"#{ticket_id} " if ticket_id else ""
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
+        ])
         await call.message.answer(
             f"✅ Заявка {ticket_ref}— <b>СОГЛАСОВАНО</b>",
             parse_mode="HTML",
-            reply_to_message_id=call.message.message_id
+            reply_to_message_id=call.message.message_id,
+            reply_markup=kb
         )
         await call.answer("✅ Согласовано")
     else:
@@ -1077,16 +1140,20 @@ async def process_refusal(message: Message, state: FSMContext):
     origin_message_id = data.get("origin_message_id")
     reason = message.text
     
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
+    ])
+    
     if await glpi.update_validation(val_id, 4, reason):
-        # Привязываем ответ к карточке тикета, а не к сообщению с причиной
         ticket_ref = f"#{ticket_id} " if ticket_id else ""
         await message.answer(
             f"❌ Заявка {ticket_ref}— <b>ОТКЛОНЕНО</b>\n💬 Причина: {reason}",
             parse_mode="HTML",
-            reply_to_message_id=origin_message_id
+            reply_to_message_id=origin_message_id,
+            reply_markup=kb
         )
     else:
-        await message.answer("⚠️ Ошибка при отклонении.")
+        await message.answer("⚠️ Ошибка при отклонении.", reply_markup=kb)
     await state.clear()
 
 # === BACKGROUND MONITOR ===
@@ -1165,6 +1232,7 @@ async def check_validations(silent=True):
             
             # Запоминаем в памяти и БД
             glpi.notified_validations.add(val_id)
+            glpi.notified_ticket_ids.add(ticket_id)  # Для дедупликации с monitor
             cursor.execute("INSERT INTO processed_validations (glpi_id) VALUES (?)", (val_id,))
             conn.commit()
             count += 1
@@ -1223,7 +1291,18 @@ async def check_tickets():
                 safe_technician = html.escape(str(technician_name)) if technician_name else ""
 
                 if row is None:
-                    # Новый тикет
+                    # Проверяем: не был ли этот тикет уже уведомлён через согласование
+                    if glpi_id in glpi.notified_ticket_ids:
+                        # Тикет уже получил уведомление "ТРЕБУЕТСЯ СОГЛАСОВАНИЕ"
+                        # Записываем в БД тихо, без повторного уведомления
+                        cursor.execute(
+                            "INSERT INTO tickets (glpi_id, status, title) VALUES (?, ?, ?)",
+                            (glpi_id, api_status, title)
+                        )
+                        conn.commit()
+                        continue
+                    
+                    # Новый тикет (без согласования) — отправляем уведомление
                     assignee_line = f"\n👷 <b>Кому:</b> {safe_technician}" if safe_technician else ""
                     content_line = f"\n📄 <i>{clean_content}</i>" if clean_content else ""
 
