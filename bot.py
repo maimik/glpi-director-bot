@@ -36,7 +36,7 @@ LOG_FILE = PROJECT_ROOT / "logs" / "bot.log"
 class Config:
     BOT_TOKEN = os.getenv("TG_BOT_TOKEN")
     ADMIN_ID = int(os.getenv("TG_ADMIN_ID", "0"))
-    
+
     GLPI_URL = os.getenv("GLPI_URL", "").rstrip('/')
     GLPI_APP_TOKEN = os.getenv("GLPI_APP_TOKEN")
     GLPI_USER_TOKEN = os.getenv("GLPI_USER_TOKEN")
@@ -420,7 +420,7 @@ class GLPIClient:
         for ticket in result:
             tid = ticket.get("id")
             
-            # Fetch locations_id from direct Ticket API (Search API returns None for location)
+            # Fetch extra fields from direct Ticket API (Search API returns None for location/priority)
             try:
                 async with aiohttp.ClientSession() as api_session:
                     ticket_url = f"{Config.GLPI_URL}/apirest.php/Ticket/{tid}"
@@ -432,11 +432,20 @@ class GLPIClient:
                                 ticket["location_name"] = await self._get_location_name(loc_id)
                             else:
                                 ticket["location_name"] = "Не указано"
+                            ticket["priority"] = ticket_data.get("priority", 3)
+                            ticket["date_creation"] = ticket_data.get("date_creation", "")
+                            ticket["users_id_lastupdater"] = ticket_data.get("users_id_lastupdater", 0)
                         else:
                             ticket["location_name"] = "Не указано"
+                            ticket["priority"] = 3
+                            ticket["date_creation"] = ""
+                            ticket["users_id_lastupdater"] = 0
             except Exception as e:
-                logger.warning(f"Failed to fetch location for ticket {tid}: {e}")
+                logger.warning(f"Failed to fetch ticket details for {tid}: {e}")
                 ticket["location_name"] = "Не указано"
+                ticket["priority"] = 3
+                ticket["date_creation"] = ""
+                ticket["users_id_lastupdater"] = 0
             
             # Requester ID -> Name (from Search API Field 4)
             req_id = ticket.get("requester_name")
@@ -553,7 +562,53 @@ class GLPIClient:
         except Exception as e:
             logger.error(f"Error fetching location: {e}")
             return f"Location #{location_id}"
-    
+
+    async def _get_ticket_solution(self, ticket_id):
+        """Получить последнее решение тикета (ITILSolution)"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{Config.GLPI_URL}/apirest.php/Ticket/{ticket_id}/ITILSolution"
+                params = {"range": "0-1", "order": "DESC", "sort": "id"}
+                async with session.get(url, headers=self.get_headers(), params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data and isinstance(data, list) and len(data) > 0:
+                            sol = data[0]
+                            user_id = sol.get("users_id", 0)
+                            content = sol.get("content", "")
+                            user_name = await self._get_user_name(user_id) if user_id else "Неизвестно"
+                            return {
+                                "user_name": user_name,
+                                "content": self.clean_html_to_text(content)
+                            }
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching solution for ticket {ticket_id}: {e}")
+            return None
+
+    async def _get_ticket_followup(self, ticket_id):
+        """Получить последний комментарий (ITILFollowup) тикета"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{Config.GLPI_URL}/apirest.php/Ticket/{ticket_id}/ITILFollowup"
+                params = {"range": "0-1", "order": "DESC", "sort": "id"}
+                async with session.get(url, headers=self.get_headers(), params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data and isinstance(data, list) and len(data) > 0:
+                            fu = data[0]
+                            user_id = fu.get("users_id", 0)
+                            content = fu.get("content", "")
+                            user_name = await self._get_user_name(user_id) if user_id else "GLPI"
+                            return {
+                                "user_name": user_name,
+                                "content": self.clean_html_to_text(content)
+                            }
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching followup for ticket {ticket_id}: {e}")
+            return None
+
     async def diagnose_search_options(self):
         """Диагностика SearchOptions для TicketValidation (проверка полей 3, 4, 7)"""
         if not self.session_token:
@@ -1025,7 +1080,7 @@ async def start_create_ticket(call: CallbackQuery, state: FSMContext):
     await call.answer()
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📋 Запрос", callback_data="ticket_type_2"),
+            InlineKeyboardButton(text="📋 Задача", callback_data="ticket_type_2"),
             InlineKeyboardButton(text="🔥 Инцидент", callback_data="ticket_type_1")
         ]
     ])
@@ -1035,8 +1090,8 @@ async def start_create_ticket(call: CallbackQuery, state: FSMContext):
 @router.callback_query(Form.waiting_for_ticket_type, F.data.startswith("ticket_type_"))
 async def process_ticket_type(call: CallbackQuery, state: FSMContext):
     await call.answer()
-    ticket_type = int(call.data.split("_")[-1])  # 1=Инцидент, 2=Запрос
-    type_name = "Инцидент" if ticket_type == 1 else "Запрос"
+    ticket_type = int(call.data.split("_")[-1])  # 1=Инцидент, 2=Задача
+    type_name = "Инцидент" if ticket_type == 1 else "Задача"
     await state.update_data(ticket_type=ticket_type)
     await call.message.edit_text(f"✅ Тип: {type_name}\n\n📝 Напишите краткую суть заявки (заголовок):")
     await state.set_state(Form.waiting_for_ticket_title)
@@ -1227,9 +1282,14 @@ async def check_validations(silent=True):
                     InlineKeyboardButton(text="❌ Отказать", callback_data=f"refuse_{val_id}_{ticket_id}")
                 ]
             ])
-            
-            await bot.send_message(Config.ADMIN_ID, msg, parse_mode="HTML", reply_markup=kb)
-            
+
+            # Отправка уведомления директору
+            try:
+                await bot.send_message(Config.ADMIN_ID, msg, parse_mode="HTML", reply_markup=kb)
+                logger.info(f"✅ Уведомление о согласовании отправлено директору (ID: {Config.ADMIN_ID})")
+            except Exception as e:
+                logger.error(f"❌ Не удалось отправить уведомление директору: {e}")
+
             # Запоминаем в памяти и БД
             glpi.notified_validations.add(val_id)
             glpi.notified_ticket_ids.add(ticket_id)  # Для дедупликации с monitor
@@ -1246,7 +1306,7 @@ async def check_tickets():
         if not tickets:
             return 0
         
-        count = 0
+        new_count = 0
         with sqlite3.connect(DATABASE_PATH) as conn:
             cursor = conn.cursor()
             
@@ -1258,10 +1318,14 @@ async def check_tickets():
                 requester_name = ticket.get('requester_name') or 'Неизвестно'
                 technician_name = ticket.get('technician_name') or ''
                 raw_content = ticket.get('content', '')
-                
-                # Очищаем контент
-                clean_content = glpi.clean_html_to_text(raw_content)[:150]
-                if len(raw_content) > 150:
+                priority = ticket.get('priority', 3)
+                date_creation = ticket.get('date_creation') or ticket.get('date', '')
+                users_id_lastupdater = ticket.get('users_id_lastupdater', 0)
+
+                # Очищаем контент (500 символов для полного отображения описания)
+                _full_content = glpi.clean_html_to_text(raw_content)
+                clean_content = _full_content[:500]
+                if len(_full_content) > 500:
                     clean_content += '...'
                 
                 if not glpi_id or not api_status:
@@ -1303,32 +1367,48 @@ async def check_tickets():
                         continue
                     
                     # Новый тикет (без согласования) — отправляем уведомление
+                    priority_names = {
+                        1: "Очень низкий", 2: "Низкий", 3: "Средний",
+                        4: "Высокий", 5: "Очень высокий", 6: "Критический"
+                    }
+                    priority_name = priority_names.get(priority, f"Уровень {priority}")
+                    date_str = str(date_creation)[:16]
+
                     assignee_line = f"\n👷 <b>Кому:</b> {safe_technician}" if safe_technician else ""
-                    content_line = f"\n📄 <i>{clean_content}</i>" if clean_content else ""
+                    desc_block = f"\n📝 <b>Описание:</b>\n<i>{clean_content}</i>" if clean_content else ""
 
                     msg = (
-                        f"{emoji} 🆕 <b>Новый тикет #{glpi_id}</b>\n"
-                        f"🏢 <b>Филиал:</b> {safe_location}\n"
-                        f"👤 <b>От кого:</b> {safe_requester}{assignee_line}\n"
-                        f"📝 <b>Тема:</b> {safe_title}{content_line}"
+                        f"🆕 <b>НОВАЯ ЗАЯВКА #{glpi_id}</b>\n\n"
+                        f"📋 {safe_title}\n\n"
+                        f"👤 <b>От кого:</b> {safe_requester}{assignee_line}"
+                        f"{desc_block}\n\n"
+                        f"📍 <b>Местоположение:</b> {safe_location}\n\n"
+                        f"📅 <b>Создано:</b> {date_str}\n"
+                        f"⚡ <b>Приоритет:</b> {priority_name}\n"
+                        f"📊 <b>Статус:</b> {get_status_name(api_status)}"
                     )
-                    
+
                     kb = InlineKeyboardMarkup(inline_keyboard=[
                         [InlineKeyboardButton(
                             text="🔗 Открыть в GLPI",
                             url=f"{Config.GLPI_URL}/front/ticket.form.php?id={glpi_id}"
                         )]
                     ])
-                    
-                    await bot.send_message(Config.ADMIN_ID, msg, parse_mode="HTML", reply_markup=kb)
-                    
+
+                    # Отправка уведомления о новом тикете директору
+                    try:
+                        await bot.send_message(Config.ADMIN_ID, msg, parse_mode="HTML", reply_markup=kb)
+                        logger.info(f"✅ Уведомление о новом тикете #{glpi_id} отправлено директору")
+                    except Exception as e:
+                        logger.error(f"❌ Не удалось отправить уведомление о тикете #{glpi_id}: {e}")
+
                     # Сохраняем в БД
                     cursor.execute(
                         "INSERT INTO tickets (glpi_id, status, title) VALUES (?, ?, ?)",
                         (glpi_id, api_status, title)
                     )
                     conn.commit()
-                    count += 1
+                    new_count += 1
                     
                 else:
                     db_status = row[0]
@@ -1336,35 +1416,73 @@ async def check_tickets():
                         # Изменение статуса
                         old_name = get_status_name(db_status)
                         new_name = get_status_name(api_status)
-                        
+
+                        # Кто изменил статус
+                        last_updater_name = await glpi._get_user_name(users_id_lastupdater) if users_id_lastupdater else "Неизвестно"
+                        safe_updater = html.escape(str(last_updater_name))
+
+                        # Emoji для нового статуса
+                        status_emoji_map = {1: "🆕", 2: "🔧", 3: "📅", 4: "⏸️", 5: "✅", 6: "🔒"}
+                        status_hdr_emoji = status_emoji_map.get(api_status, "🔄")
+
+                        # При назначении (→2) показываем кому назначена
+                        assignee_line = ""
+                        if api_status == 2 and safe_technician:
+                            assignee_line = f"\n🔧 <b>Назначена:</b> {safe_technician}"
+
+                        # Решение или комментарий
+                        solution_block = ""
+                        if api_status in [5, 6]:
+                            # Сначала ITILSolution, fallback на ITILFollowup
+                            sol_data = await glpi._get_ticket_solution(glpi_id)
+                            if sol_data and sol_data["content"]:
+                                sol_user = html.escape(sol_data["user_name"])
+                                solution_block = f"\n\n💡 <b>Решение ({sol_user}):</b>\n<i>{sol_data['content'][:500]}</i>"
+                            else:
+                                fu_data = await glpi._get_ticket_followup(glpi_id)
+                                if fu_data and fu_data["content"]:
+                                    fu_user = html.escape(fu_data["user_name"])
+                                    solution_block = f"\n\n💬 <b>Комментарий ({fu_user}):</b>\n<i>{fu_data['content'][:500]}</i>"
+                        else:
+                            # Для прочих статусов — показываем последний followup как контекст
+                            fu_data = await glpi._get_ticket_followup(glpi_id)
+                            if fu_data and fu_data["content"]:
+                                fu_user = html.escape(fu_data["user_name"])
+                                solution_block = f"\n\n💬 <b>Комментарий ({fu_user}):</b>\n<i>{fu_data['content'][:500]}</i>"
+
                         msg = (
-                            f"{emoji} 🔄 <b>Статус изменен: #{glpi_id}</b>\n"
-                            f"🏢 <b>Филиал:</b> {safe_location}\n"
-                            f"👤 <b>От кого:</b> {safe_requester}\n"
-                            f"📝 Тема: {title}\n"
-                            f"📊 {old_name} → {new_name}\n"
-                            f"⏰ {datetime.now().strftime('%H:%M')}"
+                            f"{status_hdr_emoji} <b>Статус заявки #{glpi_id} изменён</b>\n\n"
+                            f"📋 {safe_title}\n\n"
+                            f"<b>Было:</b> {old_name}\n"
+                            f"<b>Стало:</b> {new_name}\n"
+                            f"👤 <b>Кто изменил:</b> {safe_updater}"
+                            f"{assignee_line}"
+                            f"{solution_block}"
                         )
-                        
+
                         kb = InlineKeyboardMarkup(inline_keyboard=[
                             [InlineKeyboardButton(
                                 text="🔗 Открыть в GLPI",
                                 url=f"{Config.GLPI_URL}/front/ticket.form.php?id={glpi_id}"
                             )]
                         ])
-                        
-                        await bot.send_message(Config.ADMIN_ID, msg, parse_mode="HTML", reply_markup=kb)
-                        
+
+                        # Отправка уведомления об изменении статуса директору
+                        try:
+                            await bot.send_message(Config.ADMIN_ID, msg, parse_mode="HTML", reply_markup=kb)
+                            logger.info(f"✅ Уведомление об изменении статуса тикета #{glpi_id} отправлено директору")
+                        except Exception as e:
+                            logger.error(f"❌ Не удалось отправить уведомление об изменении тикета #{glpi_id}: {e}")
+
                         # Обновляем статус в БД
                         cursor.execute(
                             "UPDATE tickets SET status = ?, title = ?, last_update = CURRENT_TIMESTAMP WHERE glpi_id = ?",
                             (api_status, title, glpi_id)
                         )
                         conn.commit()
-                        count += 1
-        
-        return count
-        
+
+        return new_count
+
     except Exception as e:
         logger.error(f"Error in check_tickets: {e}")
         return 0
@@ -1373,19 +1491,20 @@ def get_status_name(status_code):
     """Получить человекочитаемое название статуса"""
     status_names = {
         1: "Новый",
-        2: "В обработке",
-        3: "Ожидает",
+        2: "В работе (назначена)",
+        3: "В работе (запланирована)",
         4: "Ожидание",
-        5: "Решен",
-        6: "Закрыт"
+        5: "Решена",
+        6: "Закрыта"
     }
     return status_names.get(status_code, f"Статус {status_code}")
 
 async def monitor_loop():
     while True:
         await check_validations()
-        await check_tickets()
-        await asyncio.sleep(Config.CHECK_INTERVAL)
+        new_tickets = await check_tickets()
+        interval = 60 if new_tickets > 0 else Config.CHECK_INTERVAL
+        await asyncio.sleep(interval)
 
 async def main():
     init_db()

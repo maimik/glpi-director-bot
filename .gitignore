@@ -1,19 +1,20 @@
-# Secrets
-.env
-
 # Python
-venv/
-venv_bot/
 __pycache__/
-*.pyc
-*.pyo
-*.egg-info/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
 
-# Runtime data
+# Logs
 logs/
-data/
-*.db
 *.log
+
+# Environment
+.env
+.env.local
 
 # IDE
 .vscode/
@@ -21,14 +22,10 @@ data/
 *.swp
 *.swo
 
+# Data
+data/
+
 # OS
 .DS_Store
 Thumbs.db
-
-# Backups
-*.bak
-*.backup
-
-# Local config
-director-bot.init
-.claude/
+.aider*

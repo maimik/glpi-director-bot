@@ -2,146 +2,292 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Memory Protocol (CRITICAL)
+
+**Definition of Done** for ANY task:
+1. **Code:** Changes implemented and verified?
+2. **Docs:** Check if documentation needs updates:
+   - **Logic/Commands/Architecture:** Update `CLAUDE.md`.
+   - **Infrastructure/IPs/Servers/Network:** Update `knowledge_base.md`.
+3. **Commit:** Push changes to git.
+
+---
+
 ## Project Overview
 
-**GLPI Director Bot** — Telegram-бот на Python для руководителя, автоматизирующий работу с GLPI.
+Telegram-бот (aiogram 3.x) для согласования заявок GLPI руководителем.
+**Единственный активный файл — `bot.py` (~1535 строк).** Всё остальное — мёртвый код из другого проекта (`director/`).
 
-**Функции:**
-- Согласование/отклонение заявок прямо из Telegram
-- Создание заявок с выбором типа (Запрос/Инцидент) и указанием описания
-- Мониторинг активных тикетов с rich-уведомлениями
-- Режим супервизора — обзор ВСЕХ ожидающих согласований
+**Сервер:** SFA-MNG (192.168.0.35), путь: `/home/maimik/Projects/GLPI_Director-Bot`
 
-**Стек:** Python 3, aiogram 3.x, aiohttp, SQLite
-**Целевая платформа:** Linux (Debian-based, SysVinit)
+### Dead-code файлы (НЕ используются ботом, не трогать)
+
+| Файл | Откуда | Примечание |
+|------|--------|------------|
+| `app.py` | director/ | Flask-приложение, Flask не установлен в venv |
+| `ai_orchestrator.py` | director/ | SSH/sgpt оркестратор |
+| `ssh_manager.py` | director/ | Connection pool для SSH |
+| `backup_manager.py` | director/ | Архивация бэкапов |
+| `config.py` | ai-chat-server/ | Flask Config class для SocketIO |
+| `requirements.txt` | director/ | Flask+SocketIO+psutil — **НЕ использовать** для бота |
+| `modules/monitor.py` | director/ | SystemMonitor (psutil) |
+| `static/`, `templates/` | director/ | Flask-шаблоны |
+
+### Зависимости бота
+
+```bash
+cd ~/Projects/GLPI_Director-Bot && source venv/bin/activate
+pip install -r requirements.txt
+```
+Фактически установлено: aiogram 3.25.0, aiohttp 3.13.3, bs4 4.14.3.
+
+---
 
 ## Commands
 
-### Service Management (на сервере)
+### Service Management
 ```bash
 service director-bot start|stop|restart|status
-tail -f $PROJECT_DIR/logs/service.log
+tail -f /home/maimik/Projects/GLPI_Director-Bot/logs/service.log
 ```
 
-### Установка сервиса
+### Debug Run
 ```bash
-sudo $PROJECT_DIR/setup_sysvinit.sh
-```
-
-### Локальная разработка
-```bash
+cd ~/Projects/GLPI_Director-Bot
 source venv/bin/activate
 python bot.py
 ```
 
-### Deployment через SSH
+### Syntax Check
 ```bash
-# Копирование изменённого файла на сервер
-scp bot.py your-server:$PROJECT_DIR/
-
-# Перезапуск
-ssh your-server "service director-bot restart"
-
-# Просмотр логов
-ssh your-server "tail -50 $PROJECT_DIR/logs/service.log"
+python3 -m py_compile /home/maimik/Projects/GLPI_Director-Bot/bot.py
 ```
+
+---
 
 ## Architecture
 
-### Ключевые модули
-| Файл | Назначение |
-|------|------------|
-| `bot.py` | Telegram бот — FSM, GLPIClient, мониторинг |
-| `modules/monitor.py` | Сбор метрик: CPU, RAM, Disk, Network |
-| `setup_sysvinit.sh` | Автоматическая установка SysVinit-сервиса |
+Весь бот — один файл `bot.py` без модулей.
 
-### Конфигурация
-- `.env` — токены (TG_BOT_TOKEN, GLPI_APP_TOKEN, GLPI_USER_TOKEN, GLPI_MY_ID)
-- `data/director.db` — SQLite (processed_validations, tickets)
+| Класс/Функция | Назначение |
+|---------------|------------|
+| `Config` | Env vars из `.env` |
+| `GLPIClient` | Async GLPI REST API клиент с session management |
+| `init_db()` | SQLite init (таблицы `processed_validations`, `tickets`) |
+| `Form(StatesGroup)` | FSM состояния (4 state) |
+| `get_main_menu_kb()` | InlineKeyboard главного меню (3 кнопки) |
+| `check_validations(silent=True)` | Фоновая проверка: личные согласования директора |
+| `check_tickets()` | Фоновая проверка: новые тикеты и смена статусов; возвращает `new_count` |
+| `monitor_loop()` | Бесконечный цикл: `check_validations → check_tickets → sleep` |
+| `get_status_name()` | Код статуса → строка (1-6) |
+| `main()` | init_db → init_session → diagnose → create_task → polling |
+
+### Конфигурация (`.env`)
+```
+TG_BOT_TOKEN, TG_ADMIN_ID
+GLPI_URL, GLPI_APP_TOKEN, GLPI_USER_TOKEN
+GLPI_MY_ID        # ID пользователя GLPI (default: 21)
+GLPI_CHECK_INTERVAL  # Интервал проверки сек (default: 300)
+```
+
+### Database (`data/director.db`)
+```sql
+processed_validations (id, glpi_id UNIQUE)  -- анти-спам: уже отправленные согласования
+tickets (id, glpi_id UNIQUE, status, title, last_update)  -- трекинг статусов тикетов
+```
+
+### Telegram-команды бота
+| Команда | Хендлер | Назначение |
+|---------|---------|------------|
+| `/start` | `cmd_start` | Главное меню |
+| `/approvals` | `cmd_approvals` | Список ВСЕХ ожидающих согласований |
+| `/my_tickets` | `cmd_my_tickets` | Мои активные заявки |
+| `/help` | `cmd_help` | Справка |
+
+Все хендлеры проверяют `message.from_user.id != Config.ADMIN_ID` → early return (бот однопользовательский).
+
+---
+
+## FSM States
+
+```python
+class Form(StatesGroup):
+    waiting_for_refusal      # Ввод причины отказа
+    waiting_for_ticket_type  # Выбор типа тикета (Задача/Инцидент)
+    waiting_for_ticket_title # Ввод темы
+    waiting_for_ticket_desc  # Ввод описания
+```
+
+---
+
+## Keyboard Helpers
+
+**Единственный хелпер:**
+```python
+get_main_menu_kb()  # 3 кнопки: Проверить согласования / Мои заявки / Создать заявку
+```
+
+Кнопка "🏠 Меню" на финальных сообщениях — inline, строится локально:
+```python
+kb = InlineKeyboardMarkup(inline_keyboard=[
+    [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
+])
+```
+
+**`callback_main_menu` (F.data == "main_menu"):**
+- Использует `call.message.answer()` (новое сообщение), **НЕ `edit_text()`**
+- Намеренно: уведомления фонового монитора нельзя редактировать
+
+---
 
 ## GLPI Integration (критичные детали)
 
-- **Получение валидаций:** прямой `GET /TicketValidation` (НЕ Search API — ненадёжный маппинг Field ID)
-- **Requester name:** отдельный запрос `GET /Ticket/{id}/Ticket_User` (type=1)
-- **HTML safety:** GLPI возвращает raw HTML → `clean_html_to_text()` перед отправкой в Telegram
-- **Button handling:** удалять keyboard, результат как НОВОЕ сообщение (избегать HTML parsing errors)
-- **Observer:** при создании заявки автоматически назначается группа Administrators (id=1) как наблюдатель
+### Инициализация сессии
+`init_session()` → авторизация → `_enable_global_view()` (`changeActiveEntities(entities_id=0, is_recursive=True)`).
+Глобальный вид нужен для видимости тикетов из всех филиалов.
 
-## SSH & File Editing Rules
+### Получение валидаций (два режима)
 
-1. **NO Complex One-Liners:** Do not try to write complex Python logic using `python -c "..."`. It fails due to shell escaping issues.
-2. **USE Quoted Heredocs:** When writing files via SSH, ALWAYS use `cat << 'EOF'` (with single quotes around EOF).
-   - Correct: `cat > filename.py << 'EOF'` (Disables shell expansion, safe for f-strings/$ symbols).
-   - Incorrect: `cat > filename.py << EOF` (Shell tries to expand variables, causing syntax errors).
-3. **NO `sed` for Logic:** Do not use `sed` to patch Python code. It is fragile. Overwrite the whole file or the specific function using a temporary python script.
-4. **Backslash in f-strings:** Use `chr(92)` to insert literal backslash when constructing strings dynamically (e.g., `f"text{chr(92)}nmore"` for `\n`).
+| Метод | Для кого | Используется |
+|-------|---------|-------------|
+| `get_pending_validations()` | Только для `GLPI_MY_ID` (status==2 AND validator==my_id) | `check_validations()` (фон) |
+| `get_all_pending_validations()` | Все ожидающие (status==2, любой validator) | callback `check_validations`, `/approvals` |
 
-## Feature Logic Reference
+Оба метода: прямой `GET /TicketValidation` с фильтрацией в Python (Search API ненадёжен — поля маппинга нестабильны).
 
-### Bot Menu Commands
-- `/start` — Главное меню с inline-кнопками
-- `/approvals` — Режим супервизора (все согласования)
-- `/my_tickets` — Активные заявки пользователя
-- `/help` — Справка по командам
+### Имя заявителя
+Отдельный запрос: `GET /Ticket/{id}/Ticket_User` → ищем `type==1` (Requester) → `_get_user_name(user_id)`.
 
-### Ticket Creation Flow
-1. Пользователь нажимает «➕ Создать заявку»
-2. Выбор типа: 📋 Запрос (по умолчанию) или 🔥 Инцидент
-3. Ввод заголовка (краткая суть)
-4. Ввод описания (подробное содержание)
-5. Создание тикета в GLPI с автоматическим назначением:
-   - Тип заявки (Запрос/Инцидент)
-   - Наблюдатель: группа Administrators
-   - Локация из профиля пользователя
+### Location + Priority + Extra fields
+Search API Field 83 ненадёжен (возвращает None).
+В `get_active_tickets()` для каждого тикета: прямой `GET /Ticket/{id}` → берём `locations_id`, `priority`, `date_creation`, `users_id_lastupdater`.
 
-### Return to Menu
-После каждой операции (создание заявки, согласование, отклонение, просмотр) отображается кнопка «🏠 Меню» для возврата в главное меню.
-
-### Notification Deduplication
-- `check_validations()` — приоритетные уведомления о согласованиях
-- `check_ticket_updates()` — уведомления о новых/изменённых тикетах
-- Если тикет уведомлён через валидацию, `check_ticket_updates` записывает его в БД **тихо** (без повторного уведомления)
-
-### Supervisor Mode (Approvals)
-Показывает ВСЕ ожидающие согласования в системе, не только свои.
-
-**Логика:**
-1. `get_all_pending_validations()` — получает все `TicketValidation` со `status=2` (Waiting)
-2. Для каждой валидации получает Parent Ticket через `get_ticket_details()`
-3. **Ghost Filtering** (критично!):
-   - Пропускать если `ticket is None` (404)
-   - Пропускать если `ticket.is_deleted == 1`
-   - Пропускать если `ticket.status == 6` (Closed)
-4. Резолвит имя валидатора: `users_id_validate` → `_get_user_name()`
-5. Подсвечивает `🔴 ВАС!` если `validator_id == Config.GLPI_MY_ID`
-
-### Smart Ticket Visibility ("My Tickets")
-Показывает заявки где пользователь участник в любой роли.
-
-**Стратегия "3 запроса + слияние":**
-1. `_fetch_by_role(4, "Requester")` — Field 4 (заявитель)
-2. `_fetch_by_role(5, "Assignee")` — Field 5 (исполнитель)
-3. `_fetch_by_role(66, "Observer")` — Field 66 (наблюдатель-пользователь)
-4. **Групповой поиск:**
-   - `get_user_groups()` → `GET /User/{id}/Group_User` → список group_ids
-   - Для каждой группы: `_fetch_by_role_group(65, group_id)` — Field 65 (наблюдатель-группа)
-5. Слияние по ID (dict) → дедупликация
-6. **Block List фильтр:** `status != 6` (показывать всё кроме Closed)
-7. **ID Resolution:** для каждого тикета резолвить location, requester, technician
-
-### Universal ID Resolution (UX критично!)
-**Правило:** НИКОГДА не показывать сырые ID пользователю. Всегда резолвить в человекочитаемые имена.
-
-**Хелперы:**
-| Метод | API Endpoint | Возвращает |
-|-------|--------------|------------|
-| `_get_user_name(id)` | `GET /User/{id}` | `firstname + realname` или `name` |
+### Вспомогательные методы GLPIClient
+| Метод | Endpoint | Возвращает |
+|-------|---------|-----------|
+| `_get_user_name(id)` | `GET /User/{id}` | `"Имя Фамилия"` или `"User #id"` |
+| `_get_entity_name(id)` | `GET /Entity/{id}` | `name` |
 | `_get_location_name(id)` | `GET /Location/{id}` | `completename` или `name` |
+| `_get_ticket_solution(id)` | `GET /Ticket/{id}/ITILSolution?range=0-1&order=DESC` | `{user_name, content}` или None |
+| `_get_ticket_followup(id)` | `GET /Ticket/{id}/ITILFollowup?range=0-1&order=DESC` | `{user_name, content}` или None |
+| `_get_user_profile(id)` | `GET /User/{id}` | полный профиль (для `locations_id`) |
+| `get_user_groups()` | `GET /User/{id}/Group_User` | список `groups_id` |
+| `diagnose_search_options()` | `GET /listSearchOptions/TicketValidation` | логирует поля 3 (Status), 4 (Date), 7 (Validator) |
 
-### GLPI Search API Field IDs
+### Создание тикета — обязательные поля
+```python
+{
+    "_users_id_requester": [Config.GLPI_MY_ID],  # МАССИВ с underscore!
+    "locations_id": locations_id,  # из профиля пользователя
+    "_groups_id_observer": [1],    # Administrators как наблюдатель
+    "type": ticket_type,           # 1=Инцидент, 2=Задача
+    "entities_id": 0,              # Root entity для глобальной видимости
+}
+```
+
+---
+
+## Create Ticket FSM Flow (3 шага)
+
+1. `waiting_for_ticket_type` — кнопки "📋 Задача" / "🔥 Инцидент" (callback: `ticket_type_2` / `ticket_type_1`)
+2. `waiting_for_ticket_title` — текстовый ввод → `edit_text()` сообщения с типом
+3. `waiting_for_ticket_desc` — текстовый ввод → `create_ticket()` → ответ с "🏠 Меню"
+
+---
+
+## My Tickets — логика "3 запроса + merge"
+
+1. Field 4 (Requester), Field 5 (Assignee), Field 66 (Observer) — по `GLPI_MY_ID`
+2. `get_user_groups()` → для каждой группы Field 65 (Observer Group)
+3. Merge по ID, фильтр `status != 6` (исключить Closed)
+4. Для каждого тикета: прямой `GET /Ticket/{id}` для `locations_id`, `priority`, etc.
+
+---
+
+## Background Monitor (`monitor_loop`)
+
+Запускается через `asyncio.create_task()` в `main()`.
+Цикл: `check_validations()` → `check_tickets()` → адаптивный `sleep`.
+
+### Адаптивный интервал
+```python
+await check_validations()              # silent=True, не влияет на интервал
+new_tickets = await check_tickets()    # возвращает только НОВЫЕ заявки (int)
+interval = 60 if new_tickets > 0 else Config.CHECK_INTERVAL  # 60 или 300 сек
+await asyncio.sleep(interval)
+```
+`check_tickets()` возвращает `new_count` — только новые заявки (первое появление в БД, `row is None`).
+Изменения статусов отслеживаются и уведомляются, но на интервал **не влияют**.
+
+### Формат уведомления о согласовании (`check_validations`)
+```
+📑 ТРЕБУЕТСЯ СОГЛАСОВАНИЕ
+
+🎫 Заявка #{ticket_id}
+👤 Кто: {requester}
+📝 Тема: {title}
+📄 Описание:
+{content[:300]}
+
+🔗 Открыть в GLPI [hyperlink]
+```
+Кнопки: "✅ Согласовать" / "❌ Отказать" — **без "🏠 Меню"**.
+Callback-формат: `approve_{val_id}_{ticket_id}`, `refuse_{val_id}_{ticket_id}`.
+Защита от дублей: in-memory `glpi.notified_validations` set + таблица `processed_validations` в SQLite.
+
+### Формат уведомления о новом тикете (`check_tickets`)
+```
+🆕 НОВАЯ ЗАЯВКА #{glpi_id}
+
+📋 {title}
+
+👤 От кого: {requester}
+[👷 Кому: {technician}]   ← если назначен
+[📝 Описание:
+{content[:500]}]
+
+📍 Местоположение: {location}
+
+📅 Создано: {date_creation[:16]}
+⚡ Приоритет: {priority_name}
+📊 Статус: {status_name}
+```
+Кнопка "🔗 Открыть в GLPI".
+Дедупликация: если тикет уже был в `glpi.notified_ticket_ids` (уведомлён через согласование) → в БД без уведомления.
+
+### Формат уведомления об изменении статуса
+```
+{emoji} Статус заявки #{id} изменён   ← 🆕🔧📅⏸️✅🔒 по статусу 1-6
+
+📋 {title}
+
+Было: {old_status}
+Стало: {new_status}
+👤 Кто изменил: {users_id_lastupdater → имя}
+[🔧 Назначена: {technician}]   ← только при статусе 2
+
+[💡 Решение ({solver}):         ← статусы 5/6: ITILSolution, fallback ITILFollowup
+{text[:500]}]
+[💬 Комментарий ({author}):    ← прочие статусы: последний ITILFollowup
+{text[:500]}]
+```
+
+---
+
+## HTML Safety
+
+Два метода — не путать:
+- `clean_html_to_text(html)` — **синхронный**, использовать везде в хендлерах. Возвращает текст, экранированный для Telegram HTML.
+- `_clean_html(html)` — async, использует BeautifulSoup (не используется в handlers напрямую).
+
+**Правило:** `content` из GLPI всегда прогонять через `clean_html_to_text()` перед отправкой.
+
+---
+
+## GLPI Search API Field IDs
 | Field | Описание |
 |-------|----------|
-| 1 | Title/Name |
+| 1 | Title |
 | 2 | Ticket ID |
 | 4 | Requester (User) |
 | 5 | Technician/Assignee |
@@ -150,27 +296,41 @@ ssh your-server "tail -50 $PROJECT_DIR/logs/service.log"
 | 21 | Content |
 | 65 | Observer Group |
 | 66 | Observer User |
-| 83 | Location |
+| 83 | Location (ненадёжен — возвращает None) |
 
-**Важно:** Search API возвращает ключи как строки (`'2'`, `'12'`), не int!
+Search API возвращает ключи как **строки** (`'2'`, `'12'`), не int.
 
-## Database Schema
+## Validation Status Codes
+| Code | Значение |
+|------|---------|
+| 2 | Waiting (нужно согласование) |
+| 3 | Approved |
+| 4 | Refused |
 
-**File:** `data/director.db` (SQLite)
+## Ticket Status Codes
+| Code | Значение |
+|------|---------|
+| 1 | New |
+| 2 | Processing (назначена) |
+| 3 | Planned |
+| 4 | Pending |
+| 5 | Solved |
+| 6 | Closed (фильтруется из списков, не отслеживается монитором) |
 
-```sql
--- Anti-spam: не отправлять повторные уведомления
-CREATE TABLE processed_validations (
-    id INTEGER PRIMARY KEY,
-    glpi_id INTEGER UNIQUE
-);
+---
 
--- Отслеживание статусов тикетов для уведомлений
-CREATE TABLE tickets (
-    id INTEGER PRIMARY KEY,
-    glpi_id INTEGER UNIQUE,
-    status INTEGER,
-    title TEXT,
-    last_update TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
+## Troubleshooting
+
+| Проблема | Причина | Решение |
+|----------|---------|---------|
+| Stale PID file | Жёсткая перезагрузка | `rm ~/Projects/GLPI_Director-Bot/data/director-bot.pid` |
+| Telegram parsing error | Raw HTML из GLPI | `clean_html_to_text()` |
+| Валидация не найдена | Search API ненадёжен | Используем прямой `/TicketValidation` с Python-фильтром |
+| Location = None | Search API Field 83 | Прямой `GET /Ticket/{id}` + `_get_location_name()` |
+| "None" в callback_data | val_id=None из API | Защита: `if "None" in call.data: return` |
+
+## Service Robustness
+
+Init-скрипт `/etc/init.d/director-bot`:
+1. **Stale PID Cleanup** — `kill -0 $PID`, удаляет мёртвые PID-файлы
+2. **Network Wait** — пингует 8.8.8.8 до 60 сек перед запуском
