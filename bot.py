@@ -179,7 +179,8 @@ class GLPIClient:
                             if status == 2 and validator_id == my_id:
                                 validations.append({
                                     'id': item['id'],
-                                    'ticket_id': item['tickets_id']
+                                    'ticket_id': item['tickets_id'],
+                                    'comment_submission': item.get('comment_submission', '')
                                 })
                                 logger.info(f"  ✅ Validation ID: {item['id']}, Ticket ID: {item['tickets_id']}, Validator: {validator_id}")
                         except (KeyError, ValueError, TypeError) as e:
@@ -1415,11 +1416,10 @@ async def check_validations(silent=True):
     with sqlite3.connect(DATABASE_PATH) as conn:
         cursor = conn.cursor()
         for val in validations:
-            # ИСПРАВЛЕНО v2.2: используем новую структуру {'id': int, 'ticket_id': int}
-            val_id = val.get('id')  # Реальный ID валидации из ключа словаря
-            ticket_id = val.get('ticket_id')  # ID тикета из Field 4
+            val_id = val.get('id')
+            ticket_id = val.get('ticket_id')
+            raw_comment = val.get('comment_submission', '')
             
-            # Проверка на None значения
             if val_id is None or ticket_id is None:
                 logger.warning(f"⚠️ Skipping validation with missing data: {val}")
                 continue
@@ -1462,12 +1462,21 @@ async def check_validations(silent=True):
             safe_requester = html.escape(requester_name)
             safe_content = short_content  # Уже экранирован в clean_html_to_text
             
+            # Комментарий запроса (comment_submission из TicketValidation)
+            comment_line = ""
+            if raw_comment:
+                clean_comment = glpi.clean_html_to_text(raw_comment)
+                if len(clean_comment) > 200:
+                    clean_comment = clean_comment[:200] + "..."
+                comment_line = f"\n💬 <b>Комментарий:</b>\n<i>{clean_comment}</i>\n"
+            
             msg = (
                 f"📑 <b>ТРЕБУЕТСЯ СОГЛАСОВАНИЕ</b>\n\n"
                 f"🎫 <b>Заявка #{ticket_id}</b>\n"
                 f"👤 <b>Кто:</b> {safe_requester}\n"
                 f"📝 <b>Тема:</b> {safe_title}\n"
-                f"📄 <b>Описание:</b>\n<i>{safe_content}</i>\n\n"
+                f"📄 <b>Описание:</b>\n<i>{safe_content}</i>"
+                f"{comment_line}\n"
                 f"🔗 <a href='{Config.GLPI_URL}/front/ticket.form.php?id={ticket_id}'>Открыть в GLPI</a>"
             )
             
