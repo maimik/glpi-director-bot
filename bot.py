@@ -738,6 +738,58 @@ class GLPIClient:
             logger.error(f"Update validation error: {e}")
             return False
 
+    async def add_ticket_followup(self, ticket_id, content):
+        """Добавить комментарий (followup) к тикету"""
+        if not self.session_token:
+            await self.init_session()
+        payload = {
+            "input": {
+                "items_id": ticket_id,
+                "itemtype": "Ticket",
+                "content": content,
+                "is_private": 0
+            }
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{Config.GLPI_URL}/apirest.php/Ticket/{ticket_id}/ITILFollowup"
+                async with session.post(url, headers=self.get_headers(), json=payload) as resp:
+                    if resp.status in [200, 201]:
+                        logger.info(f"Followup added to ticket #{ticket_id}")
+                        return True
+                    logger.error(f"Failed to add followup to #{ticket_id}: {resp.status}")
+                    return False
+        except Exception as e:
+            logger.error(f"Error adding followup to ticket {ticket_id}: {e}")
+            return False
+
+    async def create_validation(self, ticket_id, validator_id, comment=""):
+        """Создать согласование (TicketValidation) для другого пользователя"""
+        if not self.session_token:
+            await self.init_session()
+        payload = {
+            "input": {
+                "tickets_id": ticket_id,
+                "users_id_validate": validator_id,
+                "comment_submission": comment,
+                "status": 2  # WAITING
+            }
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{Config.GLPI_URL}/apirest.php/TicketValidation"
+                async with session.post(url, headers=self.get_headers(), json=payload) as resp:
+                    if resp.status in [200, 201]:
+                        data = await resp.json()
+                        val_id = data.get("id")
+                        logger.info(f"Validation #{val_id} created for user {validator_id} on ticket #{ticket_id}")
+                        return val_id
+                    logger.error(f"Failed to create validation: {resp.status}")
+                    return None
+        except Exception as e:
+            logger.error(f"Error creating validation for ticket {ticket_id}: {e}")
+            return None
+
     async def create_ticket(self, title, content, ticket_type=2):
         """Создание тикета с корректным указанием автора, локации и наблюдателя
         
@@ -808,6 +860,7 @@ class Form(StatesGroup):
     waiting_for_ticket_type = State()
     waiting_for_ticket_title = State()
     waiting_for_ticket_desc = State()
+    waiting_for_review_comment = State()
 
 # === BOT SETUP ===
 bot = Bot(token=Config.BOT_TOKEN)
@@ -1288,6 +1341,71 @@ async def process_refusal(message: Message, state: FSMContext):
         await message.answer("⚠️ Ошибка при отклонении.", reply_markup=kb)
     await state.clear()
 
+# --- REVIEW REQUEST LOGIC ---
+
+REVIEW_TARGET_ID = 7  # Maimescul Andrei
+
+@router.callback_query(F.data.startswith("review_"))
+async def review_handler(call: CallbackQuery, state: FSMContext):
+    """Директор хочет запросить проверку — спрашивает комментарий"""
+    if "None" in call.data:
+        await call.answer("❌ Ошибка: неверный ID", show_alert=True)
+        return
+    try:
+        parts = call.data.split("_")
+        val_id = int(parts[1])
+        ticket_id = int(parts[2]) if len(parts) > 2 else None
+    except (ValueError, IndexError):
+        await call.answer("❌ Ошибка формата данных", show_alert=True)
+        return
+
+    await state.update_data(val_id=val_id, ticket_id=ticket_id)
+    await call.message.answer(
+        "📝 <b>Запросить проверку</b>\n\n"
+        "Напишите текст для Maimescul Andrei\n"
+        "(вопросы, уточнения, дополнения):",
+        parse_mode="HTML"
+    )
+    await state.set_state(Form.waiting_for_review_comment)
+    await call.answer()
+
+@router.message(Form.waiting_for_review_comment)
+async def process_review_comment(message: Message, state: FSMContext):
+    """Получен комментарий — создаём followup + новое согласование для id=7"""
+    data = await state.get_data()
+    val_id = data.get("val_id")
+    ticket_id = data.get("ticket_id")
+    comment = message.text
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]
+    ])
+
+    # 1. Добавляем followup к тикету
+    followup_text = f"📩 <b>Запрос проверки от директора:</b>\n\n{html.escape(comment)}"
+    await glpi.add_ticket_followup(ticket_id, followup_text)
+
+    # 2. Создаём новое согласование для Maimescul Andrei
+    review_comment = f"Директор запросил проверку:\n\n{comment}"
+    new_val_id = await glpi.create_validation(ticket_id, REVIEW_TARGET_ID, review_comment)
+
+    if new_val_id:
+        await message.answer(
+            f"✅ <b>Запрос проверки отправлен</b>\n\n"
+            f"🎫 Заявка #{ticket_id}\n"
+            f"👤 Получатель: Maimescul Andrei\n"
+            f"💬 Комментарий: {comment[:200]}\n\n"
+            f"🔗 <a href='{Config.GLPI_URL}/front/ticket.form.php?id={ticket_id}'>Открыть в GLPI</a>",
+            parse_mode="HTML",
+            reply_markup=kb,
+            disable_web_page_preview=True
+        )
+        logger.info(f"Review request sent for #{ticket_id}, new validation #{new_val_id}")
+    else:
+        await message.answer("⚠️ Ошибка при создании запроса проверки.", reply_markup=kb)
+
+    await state.clear()
+
 # === BACKGROUND MONITOR ===
 
 async def check_validations(silent=True):
@@ -1357,6 +1475,9 @@ async def check_validations(silent=True):
                 [
                     InlineKeyboardButton(text="✅ Согласовать", callback_data=f"approve_{val_id}_{ticket_id}"),
                     InlineKeyboardButton(text="❌ Отказать", callback_data=f"refuse_{val_id}_{ticket_id}")
+                ],
+                [
+                    InlineKeyboardButton(text="📩 Запросить проверку", callback_data=f"review_{val_id}_{ticket_id}")
                 ]
             ])
 
