@@ -39,7 +39,7 @@ Telegram-бот (aiogram 3.x) для согласования заявок GLPI 
 cd ~/Projects/GLPI_Director-Bot && source venv/bin/activate
 pip install -r requirements.txt
 ```
-Фактически установлено: aiogram 3.25.0, aiohttp 3.13.3, bs4 4.14.3.
+Фактически установлено: aiogram 3.29.0, aiohttp 3.13.3, bs4 4.14.3.
 
 ---
 
@@ -72,15 +72,20 @@ python3 -m py_compile /home/maimik/Projects/GLPI_Director-Bot/bot.py
 | Класс/Функция | Назначение |
 |---------------|------------|
 | `Config` | Env vars из `.env` |
-| `GLPIClient` | Async GLPI REST API клиент с session management |
+| `GLPIClient` | Async GLPI REST API клиент с session management + auto-reauth |
+| `GLPIClient.get_ticket_tasks()` | ITILTask для тикета (`GET /Ticket/{id}/ITILTask`) |
+| `GLPIClient.get_ticket_technician()` | Имя техника (Ticket_User type=2) |
+| `GLPIClient.get_ticket_validations()` | Согласования тикета |
+| `GLPIClient._ensure_session()` | Auto-reauth при 401/403 |
+| `GLPIClient._api_request()` | Unified API request с retry |
 | `init_db()` | SQLite init (таблицы `processed_validations`, `tickets`) |
 | `Form(StatesGroup)` | FSM состояния (4 state) |
 | `get_main_menu_kb()` | InlineKeyboard главного меню (3 кнопки) |
 | `check_validations(silent=True)` | Фоновая проверка: личные согласования директора |
 | `check_tickets()` | Фоновая проверка: новые тикеты и смена статусов; возвращает `new_count` |
-| `monitor_loop()` | Бесконечный цикл: `check_validations → check_tickets → sleep` |
+| `monitor_loop()` | Supervisor pattern: try/except + exponential backoff (30s→300s) |
 | `get_status_name()` | Код статуса → строка (1-6) |
-| `main()` | init_db → init_session → diagnose → create_task → polling |
+| `main()` | init_db → init_session → diagnose → create_task → polling + graceful shutdown |
 
 ### Конфигурация (`.env`)
 ```
@@ -168,11 +173,16 @@ Search API Field 83 ненадёжен (возвращает None).
 | `_get_user_name(id)` | `GET /User/{id}` | `"Имя Фамилия"` или `"User #id"` |
 | `_get_entity_name(id)` | `GET /Entity/{id}` | `name` |
 | `_get_location_name(id)` | `GET /Location/{id}` | `completename` или `name` |
-| `_get_ticket_solution(id)` | `GET /Ticket/{id}/ITILSolution?range=0-1&order=DESC` | `{user_name, content}` или None |
-| `_get_ticket_followup(id)` | `GET /Ticket/{id}/ITILFollowup?range=0-1&order=DESC` | `{user_name, content}` или None |
+| `_get_ticket_solution(id)` | `GET /Ticket/{id}/ITILSolution?range=0-1` | `{user_name, content}` или None |
+| `_get_ticket_followup(id)` | `GET /Ticket/{id}/ITILFollowup?range=0-1` | `{user_name, content}` или None |
+| `get_ticket_tasks(id)` | `GET /Ticket/{id}/ITILTask?range=0-49` | список задач |
+| `get_ticket_technician(id)` | `GET /Ticket/{id}/Ticket_User` | имя техника (type=2) или None |
+| `get_ticket_validations(id)` | `GET /Ticket/{id}/TicketValidation` | список согласований |
 | `_get_user_profile(id)` | `GET /User/{id}` | полный профиль (для `locations_id`) |
 | `get_user_groups()` | `GET /User/{id}/Group_User` | список `groups_id` |
-| `diagnose_search_options()` | `GET /listSearchOptions/TicketValidation` | логирует поля 3 (Status), 4 (Date), 7 (Validator) |
+| `_ensure_session()` | — | проверка + auto-reauth при 401/403 |
+| `_api_request(method, endpoint)` | любой | unified API request с retry |
+| `diagnose_search_options()` | `GET /listSearchOptions/TicketValidation` | логирует поля |
 
 ### Создание тикета — обязательные поля
 ```python
@@ -206,8 +216,9 @@ Search API Field 83 ненадёжен (возвращает None).
 
 ## Background Monitor (`monitor_loop`)
 
-Запускается через `asyncio.create_task()` в `main()`.
-Цикл: `check_validations()` → `check_tickets()` → адаптивный `sleep`.
+Запускается через `asyncio.create_task()` в `main()`, отслеживается в `_supervised_tasks`.
+**Supervisor pattern:** try/except внутри цикла + exponential backoff (30s→300s, max попыток не ограничена).
+При `asyncio.CancelledError` — graceful exit. Graceful shutdown в `main()`: отмена всех `_supervised_tasks`.
 
 ### Адаптивный интервал
 ```python
@@ -255,22 +266,29 @@ Callback-формат: `approve_{val_id}_{ticket_id}`, `refuse_{val_id}_{ticket_
 Кнопка "🔗 Открыть в GLPI".
 Дедупликация: если тикет уже был в `glpi.notified_ticket_ids` (уведомлён через согласование) → в БД без уведомления.
 
-### Формат уведомления об изменении статуса
+### Формат уведомления об изменении статуса (Citadel 4.8)
 ```
 {emoji} Статус заявки #{id} изменён   ← 🆕🔧📅⏸️✅🔒 по статусу 1-6
 
 📋 {title}
 
-Было: {old_status}
-Стало: {new_status}
-👤 Кто изменил: {users_id_lastupdater → имя}
-[🔧 Назначена: {technician}]   ← только при статусе 2
+👤 От кого: {requester}
+📝 Описание: {content[:300]}
 
-[💡 Решение ({solver}):         ← статусы 5/6: ITILSolution, fallback ITILFollowup
-{text[:500]}]
-[💬 Комментарий ({author}):    ← прочие статусы: последний ITILFollowup
-{text[:500]}]
+📍 Местоположение: {location}
+
+📅 Создано: {date_creation}
+⚡ Приоритет: {priority_name}
+📊 Статус: {old_status} → {new_status}
+👤 Кто изменил: {updater}
+[🔧 Назначена: {technician}]       ← всегда, не только статус 2
+[⏳ На согласовании у: {names}]   ← если есть pending validations
+[💡 Решение/💬 Комментарий]       ← для статусов 5/6 и прочих
+[📂 Задачи:]                       ← ITILTask (emoji + text + tech + time + dates)
+[🔖 Других изменений не производилось]  ← если ничего кроме статуса
 ```
+ITILTask status: 1=⬜ TODO, 2=🔄 DOING, 3=✅ DONE, 4=⏳ WAITING, 5=❌ CANCELLED.
+`actiontime` в секундах.
 
 ---
 
@@ -334,3 +352,13 @@ Search API возвращает ключи как **строки** (`'2'`, `'12'
 Init-скрипт `/etc/init.d/director-bot`:
 1. **Stale PID Cleanup** — `kill -0 $PID`, удаляет мёртвые PID-файлы
 2. **Network Wait** — пингует 8.8.8.8 до 60 сек перед запуском
+
+## graphify
+
+This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
+
+Rules:
+- For codebase questions, first run `graphify query "<question>"` when graphify-out/graph.json exists. Use `graphify path "<A>" "<B>"` for relationships and `graphify explain "<concept>"` for focused concepts. These return a scoped subgraph, usually much smaller than GRAPH_REPORT.md or raw grep output.
+- If graphify-out/wiki/index.md exists, use it for broad navigation instead of raw source browsing.
+- Read graphify-out/GRAPH_REPORT.md only for broad architecture review or when query/path/explain do not surface enough context.
+- After modifying code, run `graphify update .` to keep the graph current (AST-only, no API cost).

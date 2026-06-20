@@ -609,6 +609,83 @@ class GLPIClient:
             logger.error(f"Error fetching followup for ticket {ticket_id}: {e}")
             return None
 
+    async def get_ticket_tasks(self, ticket_id):
+        """Получить все задачи (ITILTask) тикета"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{Config.GLPI_URL}/apirest.php/Ticket/{ticket_id}/ITILTask"
+                params = {"range": "0-49"}
+                async with session.get(url, headers=self.get_headers(), params=params) as resp:
+                    if resp.status == 200:
+                        tasks = await resp.json()
+                        return tasks if isinstance(tasks, list) else []
+            return []
+        except Exception as e:
+            logger.error(f"Error fetching tasks for ticket {ticket_id}: {e}")
+            return []
+
+    async def get_ticket_technician(self, ticket_id):
+        """Получить имя назначенного техника (Ticket_User type=2)"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{Config.GLPI_URL}/apirest.php/Ticket/{ticket_id}/Ticket_User"
+                async with session.get(url, headers=self.get_headers()) as resp:
+                    if resp.status == 200:
+                        users = await resp.json()
+                        for user in users:
+                            if user.get("type") == 2:
+                                uid = user.get("users_id")
+                                return await self._get_user_name(int(uid)) if uid else None
+            return None
+        except Exception as e:
+            logger.error(f"Error fetching technician for ticket {ticket_id}: {e}")
+            return None
+
+    async def get_ticket_validations(self, ticket_id):
+        """Получить все согласования тикета"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{Config.GLPI_URL}/apirest.php/Ticket/{ticket_id}/TicketValidation"
+                async with session.get(url, headers=self.get_headers()) as resp:
+                    if resp.status == 200:
+                        vals = await resp.json()
+                        return vals if isinstance(vals, list) else []
+            return []
+        except Exception as e:
+            logger.error(f"Error fetching validations for ticket {ticket_id}: {e}")
+            return []
+
+    async def _ensure_session(self):
+        """Проверить сессию, при 401/403 — перелогиниться"""
+        if not self.session_token:
+            return await self.init_session()
+        return True
+
+    async def _api_request(self, method, endpoint, **kwargs):
+        """Unified API request with auto-reauth on 401/403"""
+        if not await self._ensure_session():
+            return None
+        for attempt in range(2):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    url = f"{Config.GLPI_URL}/apirest.php{endpoint}"
+                    func = getattr(session, method)
+                    async with func(url, headers=self.get_headers(), **kwargs) as resp:
+                        if resp.status in [401, 403] and attempt == 0:
+                            logger.warning(f"GLPI session expired ({resp.status}), re-authenticating...")
+                            await self.init_session()
+                            continue
+                        if resp.status in [200, 201, 206]:
+                            return await resp.json()
+                        return None
+            except Exception as e:
+                logger.error(f"API request {method} {endpoint}: {e}")
+                if attempt == 0:
+                    await self.init_session()
+                    continue
+                return None
+        return None
+
     async def diagnose_search_options(self):
         """Диагностика SearchOptions для TicketValidation (проверка полей 3, 4, 7)"""
         if not self.session_token:
@@ -1354,6 +1431,11 @@ async def check_tickets():
                 safe_requester = html.escape(str(requester_name))
                 safe_technician = html.escape(str(technician_name)) if technician_name else ""
 
+                priority_names = {
+                    1: "Очень низкий", 2: "Низкий", 3: "Средний",
+                    4: "Высокий", 5: "Очень высокий", 6: "Критический"
+                }
+
                 if row is None:
                     # Проверяем: не был ли этот тикет уже уведомлён через согласование
                     if glpi_id in glpi.notified_ticket_ids:
@@ -1367,10 +1449,6 @@ async def check_tickets():
                         continue
                     
                     # Новый тикет (без согласования) — отправляем уведомление
-                    priority_names = {
-                        1: "Очень низкий", 2: "Низкий", 3: "Средний",
-                        4: "Высокий", 5: "Очень высокий", 6: "Критический"
-                    }
                     priority_name = priority_names.get(priority, f"Уровень {priority}")
                     date_str = str(date_creation)[:16]
 
@@ -1413,27 +1491,50 @@ async def check_tickets():
                 else:
                     db_status = row[0]
                     if db_status != api_status:
-                        # Изменение статуса
+                        # Изменение статуса — полный контекст
                         old_name = get_status_name(db_status)
                         new_name = get_status_name(api_status)
 
-                        # Кто изменил статус
-                        last_updater_name = await glpi._get_user_name(users_id_lastupdater) if users_id_lastupdater else "Неизвестно"
+                        # Получаем полные данные тикета
+                        full_ticket = await glpi.get_ticket_details(glpi_id)
+                        if not full_ticket:
+                            full_ticket = ticket
+
+                        # Кто изменил
+                        updater_id = full_ticket.get('users_id_lastupdater', 0)
+                        last_updater_name = await glpi._get_user_name(updater_id) if updater_id else "Неизвестно"
                         safe_updater = html.escape(str(last_updater_name))
 
                         # Emoji для нового статуса
                         status_emoji_map = {1: "🆕", 2: "🔧", 3: "📅", 4: "⏸️", 5: "✅", 6: "🔒"}
                         status_hdr_emoji = status_emoji_map.get(api_status, "🔄")
 
-                        # При назначении (→2) показываем кому назначена
-                        assignee_line = ""
-                        if api_status == 2 and safe_technician:
-                            assignee_line = f"\n🔧 <b>Назначена:</b> {safe_technician}"
+                        # Назначение (всегда)
+                        assignee = await glpi.get_ticket_technician(glpi_id)
+                        assignee_line = f"\n🔧 <b>Назначена:</b> {html.escape(assignee)}" if assignee else ""
 
-                        # Решение или комментарий
+                        # Pending согласования
+                        validation_line = ""
+                        try:
+                            validations = await glpi.get_ticket_validations(glpi_id)
+                            if validations:
+                                pending = [v for v in validations if int(v.get('status', 0)) in (1, 2)]
+                                if pending:
+                                    uid_set = list({int(v['users_id_validate']) for v in pending if v.get('users_id_validate')})
+                                    names = []
+                                    for uid in uid_set[:2]:
+                                        n = await glpi._get_user_name(uid)
+                                        if n:
+                                            names.append(n)
+                                    if names:
+                                        escaped = [html.escape(n) for n in names]
+                                        validation_line = f"\n⏳ <b>На согласовании у:</b> {', '.join(escaped)}"
+                        except Exception:
+                            pass
+
+                        # Решение / комментарий
                         solution_block = ""
                         if api_status in [5, 6]:
-                            # Сначала ITILSolution, fallback на ITILFollowup
                             sol_data = await glpi._get_ticket_solution(glpi_id)
                             if sol_data and sol_data["content"]:
                                 sol_user = html.escape(sol_data["user_name"])
@@ -1444,20 +1545,71 @@ async def check_tickets():
                                     fu_user = html.escape(fu_data["user_name"])
                                     solution_block = f"\n\n💬 <b>Комментарий ({fu_user}):</b>\n<i>{fu_data['content'][:500]}</i>"
                         else:
-                            # Для прочих статусов — показываем последний followup как контекст
                             fu_data = await glpi._get_ticket_followup(glpi_id)
                             if fu_data and fu_data["content"]:
                                 fu_user = html.escape(fu_data["user_name"])
                                 solution_block = f"\n\n💬 <b>Комментарий ({fu_user}):</b>\n<i>{fu_data['content'][:500]}</i>"
 
+                        # Задачи (ITILTask)
+                        TASK_STATUS = {1: '⬜', 2: '🔄', 3: '✅', 4: '⏳', 5: '❌'}
+                        tasks_block = ""
+                        try:
+                            tasks = await glpi.get_ticket_tasks(glpi_id)
+                            if tasks:
+                                task_lines = []
+                                for t in tasks:
+                                    t_status = int(t.get('status', 0))
+                                    t_emoji = TASK_STATUS.get(t_status, '❓')
+                                    t_text = glpi.clean_html_to_text(t.get('content', ''))
+                                    if len(t_text) > 100:
+                                        t_text = t_text[:100] + '...'
+                                    t_tech = ""
+                                    t_tech_id = t.get('users_id_tech')
+                                    if t_tech_id:
+                                        tech_name = await glpi._get_user_name(int(t_tech_id))
+                                        if tech_name:
+                                            t_tech = f" → {html.escape(tech_name)}"
+                                    t_time = ""
+                                    actiontime = t.get('actiontime', 0)
+                                    if actiontime and int(actiontime) > 0:
+                                        total_sec = int(actiontime)
+                                        hours, remainder = divmod(total_sec, 3600)
+                                        minutes, _ = divmod(remainder, 60)
+                                        t_time = f" ⏱ {hours}ч {minutes}м"
+                                    t_dates = ""
+                                    ds = t.get('date_start', '')
+                                    de = t.get('date_end', '')
+                                    if ds and de:
+                                        t_dates = f" ({ds[-8:-3]} → {de[-8:-3]})"
+                                    elif ds:
+                                        t_dates = f" (с {ds[-8:-3]})"
+                                    task_lines.append(f"  {t_emoji} {html.escape(t_text)}{t_tech}{t_time}{t_dates}")
+                                if task_lines:
+                                    tasks_block = "\n\n📂 <b>Задачи:</b>\n" + "\n".join(task_lines)
+                        except Exception:
+                            pass
+
+                        # "Других изменений нет"
+                        changes_line = ""
+                        if not solution_block and not assignee_line and not validation_line and not tasks_block:
+                            changes_line = "\n\n🔖 Других изменений в заявке не производилось"
+
                         msg = (
                             f"{status_hdr_emoji} <b>Статус заявки #{glpi_id} изменён</b>\n\n"
                             f"📋 {safe_title}\n\n"
-                            f"<b>Было:</b> {old_name}\n"
-                            f"<b>Стало:</b> {new_name}\n"
-                            f"👤 <b>Кто изменил:</b> {safe_updater}"
+                            f"👤 <b>От кого:</b> {safe_requester}\n"
+                            f"📝 <b>Описание:</b>\n<i>{clean_content}</i>\n\n"
+                            f"📍 <b>Местоположение:</b> {safe_location}\n\n"
+                            f"📅 <b>Создано:</b> {date_creation[:16] if date_creation else 'N/A'}\n"
+                            f"⚡ <b>Приоритет:</b> {priority_names.get(priority, 'Неизвестно')}\n"
+                            f"📊 <b>Статус:</b> {old_name} → {new_name}"
+                            f"\n👤 <b>Кто изменил:</b> {safe_updater}"
                             f"{assignee_line}"
+                            f"{validation_line}"
                             f"{solution_block}"
+                            f"{tasks_block}"
+                            f"{changes_line}\n\n"
+                            f"🔗 <a href='{Config.GLPI_URL}/front/ticket.form.php?id={glpi_id}'>Открыть в GLPI</a>"
                         )
 
                         kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1500,26 +1652,39 @@ def get_status_name(status_code):
     return status_names.get(status_code, f"Статус {status_code}")
 
 async def monitor_loop():
+    """Фоновый мониторинг с supervisor pattern и exponential backoff"""
+    attempt = 0
     while True:
-        await check_validations()
-        new_tickets = await check_tickets()
-        interval = 60 if new_tickets > 0 else Config.CHECK_INTERVAL
-        await asyncio.sleep(interval)
+        try:
+            await check_validations()
+            new_tickets = await check_tickets()
+            interval = 60 if new_tickets > 0 else Config.CHECK_INTERVAL
+            attempt = 0  # Сброс при успешном цикле
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            logger.info("[supervisor] monitor_loop cancelled")
+            break
+        except Exception as e:
+            attempt += 1
+            backoff = min(30 * attempt, 300)  # 30s, 60s, 90s... max 300s
+            logger.error(f"[supervisor] monitor_loop error (attempt {attempt}): {e}", exc_info=True)
+            await asyncio.sleep(backoff)
+
+_supervised_tasks = []
 
 async def main():
     init_db()
     await glpi.init_session()
     
-    # Диагностика SearchOptions (проверка корректности полей)
     logger.info("🔧 Running SearchOptions diagnostic...")
     await glpi.diagnose_search_options()
     
     dp.include_router(router)
     
-    # Запуск фонового мониторинга
-    asyncio.create_task(monitor_loop())
+    # Запуск фонового мониторинга с отслеживанием
+    monitor_task = asyncio.create_task(monitor_loop())
+    _supervised_tasks.append(monitor_task)
     
-    # Установка команд меню
     await bot.set_my_commands([
         BotCommand(command="start", description="🏠 Главное меню"),
         BotCommand(command="approvals", description="⏳ Статус всех согласований"),
@@ -1529,7 +1694,16 @@ async def main():
     logger.info("✅ Bot commands set")
 
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # Graceful shutdown
+        logger.info("🛑 Shutting down...")
+        for task in _supervised_tasks:
+            task.cancel()
+        await asyncio.gather(*_supervised_tasks, return_exceptions=True)
+        logger.info("✅ Shutdown complete")
 
 if __name__ == "__main__":
     asyncio.run(main())
