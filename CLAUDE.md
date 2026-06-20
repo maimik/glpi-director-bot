@@ -117,10 +117,11 @@ tickets (id, glpi_id UNIQUE, status, title, last_update)  -- трекинг ст
 
 ```python
 class Form(StatesGroup):
-    waiting_for_refusal      # Ввод причины отказа
-    waiting_for_ticket_type  # Выбор типа тикета (Задача/Инцидент)
-    waiting_for_ticket_title # Ввод темы
-    waiting_for_ticket_desc  # Ввод описания
+    waiting_for_refusal       # Ввод причины отказа
+    waiting_for_ticket_type   # Выбор типа тикета (Задача/Инцидент)
+    waiting_for_ticket_title  # Ввод темы
+    waiting_for_ticket_desc   # Ввод описания
+    waiting_for_review_comment # Текст запроса проверки → id=7
 ```
 
 ---
@@ -178,6 +179,8 @@ Search API Field 83 ненадёжен (возвращает None).
 | `get_ticket_tasks(id)` | `GET /Ticket/{id}/ITILTask?range=0-49` | список задач |
 | `get_ticket_technician(id)` | `GET /Ticket/{id}/Ticket_User` | имя техника (type=2) или None |
 | `get_ticket_validations(id)` | `GET /Ticket/{id}/TicketValidation` | список согласований |
+| `add_ticket_followup(id, text)` | `POST /Ticket/{id}/ITILFollowup` | добавить комментарий |
+| `create_validation(id, uid, text)` | `POST /TicketValidation` | создать согласование для пользователя |
 | `_get_user_profile(id)` | `GET /User/{id}` | полный профиль (для `locations_id`) |
 | `get_user_groups()` | `GET /User/{id}/Group_User` | список `groups_id` |
 | `_ensure_session()` | — | проверка + auto-reauth при 401/403 |
@@ -242,9 +245,14 @@ await asyncio.sleep(interval)
 
 🔗 Открыть в GLPI [hyperlink]
 ```
-Кнопки: "✅ Согласовать" / "❌ Отказать" — **без "🏠 Меню"**.
-Callback-формат: `approve_{val_id}_{ticket_id}`, `refuse_{val_id}_{ticket_id}`.
+Кнопки: "✅ Согласовать" / "❌ Отказать" / "📩 Запросить проверку".
+Callback-формат: `approve_{val_id}_{ticket_id}`, `refuse_{val_id}_{ticket_id}`, `review_{val_id}_{ticket_id}`.
 Защита от дублей: in-memory `glpi.notified_validations` set + таблица `processed_validations` в SQLite.
+
+### Запрос проверки (review)
+Director нажимает `📩 Запросить проверку` → FSM `waiting_for_review_comment` → вводит текст →
+1. `add_ticket_followup()` — комментарий директора в тикет
+2. `create_validation(ticket_id, 7, comment)` — новое согласование для Maimescul Andrei (id=7)
 
 ### Формат уведомления о новом тикете (`check_tickets`)
 ```
