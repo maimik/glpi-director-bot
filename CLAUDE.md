@@ -176,7 +176,9 @@ Search API Field 83 ненадёжен (возвращает None).
 | `_get_location_name(id)` | `GET /Location/{id}` | `completename` или `name` |
 | `_get_ticket_solution(id)` | `GET /Ticket/{id}/ITILSolution?range=0-1` | `{user_name, content}` или None |
 | `_get_ticket_followup(id)` | `GET /Ticket/{id}/ITILFollowup?range=0-1` | `{user_name, content}` или None |
-| `get_ticket_tasks(id)` | `GET /Ticket/{id}/ITILTask?range=0-49` | список задач |
+| `get_ticket_followups(id)` | `GET /Ticket/{id}/ITILFollowup?range=0-99` | список всех комментариев + `date_creation` |
+| `get_ticket_solutions(id)` | `GET /Ticket/{id}/ITILSolution?range=0-99` | список всех решений + `date_creation` |
+| `get_ticket_tasks(id)` | `GET /Ticket/{id}/TicketTask?range=0-49` | список задач |
 | `get_ticket_technician(id)` | `GET /Ticket/{id}/Ticket_User` | имя техника (type=2) или None |
 | `get_ticket_validations(id)` | `GET /Ticket/{id}/TicketValidation` | список согласований |
 | `add_ticket_followup(id, text)` | `POST /Ticket/{id}/ITILFollowup` | добавить комментарий |
@@ -210,10 +212,54 @@ Search API Field 83 ненадёжен (возвращает None).
 
 ## My Tickets — логика "3 запроса + merge"
 
+`GLPIClient.get_active_tickets()` — используется ТОЛЬКО в `/my_tickets` и callback `my_tickets`
+(личные заявки директора). **НЕ использовать в фоновом мониторе** — см. `get_all_active_tickets()` ниже.
+
 1. Field 4 (Requester), Field 5 (Assignee), Field 66 (Observer) — по `GLPI_MY_ID`
 2. `get_user_groups()` → для каждой группы Field 65 (Observer Group)
 3. Merge по ID, фильтр `status != 6` (исключить Closed)
 4. Для каждого тикета: прямой `GET /Ticket/{id}` для `locations_id`, `priority`, etc.
+
+Общая логика дозаполнения полей (шаг 4) вынесена в `GLPIClient._resolve_ticket_extra_fields()` —
+переиспользуется и `get_active_tickets()`, и `get_all_active_tickets()`.
+
+### `get_all_active_tickets()` — для фонового монитора (Citadel, 2026-07-03)
+
+Отдельный метод: `search/Ticket` по статусам 1-5, БЕЗ фильтра по роли пользователя. Нужен, т.к. GLPI
+**не добавляет** группу Administrators как observer ко всем тикетам автоматически — директор
+(`GLPI_MY_ID`) не является формальным участником большинства тикетов, и `get_active_tickets()` их не
+видит. `check_tickets()` использует именно `get_all_active_tickets()`.
+
+**КРИТИЧНО — `criteria[searchtype]=notequals` на поле 12 (Status) в этой версии GLPI Search API
+не работает как исключение (реальный инцидент 2026-07-03/04):** первая версия метода делала
+`field=12, searchtype=notequals, value=6` ("статус != Закрыта") и получала `totalcount=398`.
+Проверка напрямую (`GET /search/Ticket` без фильтра) показала: в системе 407 тикетов, из них
+**398 реально имеют статус=6 (Closed)** — `notequals` на этом поле фактически вёл себя как `equals`.
+Реально активных (статусы 1-5) было всего **9**. Из-за этого бага фоновый монитор всю сессию
+работал не с активными тикетами, а с закрытыми — новые/изменённые реальные тикеты (например
+запрошенные изменения статуса) в выборку вообще не попадали.
+
+**Правильный и проверенный способ** — явный `OR` по `equals` для каждого активного статуса
+(как уже делает sysadmin-bot, `services/glpi.py: get_active_tickets`, лог "Fetched N active
+tickets (statuses 1-5)"):
+```python
+criteria[0]: field=12, searchtype=equals, value=1
+criteria[1..4]: link=OR, field=12, searchtype=equals, value=2/3/4/5
+```
+НЕ использовать `notequals` для поля Status в этом инстансе GLPI, даже для других запросов —
+баг не проверялся на других полях, но на этом поле воспроизводится стабильно и одним запросом.
+Активных тикетов обычно единицы (в момент находки — 9), пагинация избыточна: `range=0-999` в одном
+запросе достаточно.
+
+**Ловушка №2 (реальный инцидент 2026-07-03):** если переключить фоновый монитор на "все активные
+тикеты" без предварительного сидинга таблицы `tickets` в SQLite — на первом же цикле ВСЕ тикеты,
+которых раньше не было в БД (потому что монитор видел только личные тикеты директора), будут
+расценены как `row is None` → "новая заявка" → директору улетит уведомление о каждом из них,
+включая тикеты полугодовой давности. При смене логики выборки для монитора — сначала тихо (без
+`bot.send_message`) вставить в БД все `glpi_id`, которых там ещё нет, и только потом переключать
+`check_tickets()` на новый источник. Также желательно UPDATE-нуть `status`/`title` для УЖЕ
+существующих строк (не только INSERT отсутствующих) — иначе возможны "дыры" в истории для старых
+тикетов, чей статус менялся, пока монитор их не отслеживал.
 
 ---
 
@@ -295,8 +341,21 @@ Director нажимает `📩 Запросить проверку` → FSM `wa
 [📂 Задачи:]                       ← ITILTask (emoji + text + tech + time + dates)
 [🔖 Других изменений не производилось]  ← если ничего кроме статуса
 ```
-ITILTask status: 1=⬜ TODO, 2=🔄 DOING, 3=✅ DONE, 4=⏳ WAITING, 5=❌ CANCELLED.
+ITILTask status (поле `state`, не `status`): 1=⬜ TODO, 2=🔄 DOING, 3=✅ DONE, 4=⏳ WAITING, 5=❌ CANCELLED.
+**Endpoint — `TicketTask`, не `ITILTask`** (абстрактный класс, не REST-ресурс, даёт 400
+`ERROR_RESOURCE_NOT_FOUND_NOR_COMMONDBTM`). Баг обнаружен 2026-07-03: тикет #2607020001 содержал
+2 задачи, но блок «📂 Задачи:» не появился в уведомлении — `except: pass` без логирования скрывал
+ошибку с момента внедрения фичи (Citadel 4.8).
 `actiontime` в секундах.
+
+**Решение/комментарий к смене статуса (2026-07-03, портировано из sysadmin-bot):**
+`check_tickets()` сначала ищет `ITILFollowup` и `ITILSolution`, созданные в пределах ±2 минут от
+`date_mod` тикета (`recent_followups` / `recent_solutions`). Нужно, т.к. между опросами
+(`Config.CHECK_INTERVAL`) может произойти НЕСКОЛЬКО смен статуса подряд — например 2→5 (с
+добавлением решения) и сразу следом 5→3 (решение отклонили). Бот видит только итоговый переход
+`2→3`, а текст решения лежит в `ITILSolution`, а не в `ITILFollowup`.
+Приоритет в ветке `else` (итоговый статус не 5/6): `recent_solutions` → `recent_followups` →
+последний `_get_ticket_followup()` как fallback.
 
 ---
 

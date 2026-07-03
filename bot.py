@@ -12,7 +12,7 @@ import logging
 import sqlite3
 import html
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import (
@@ -326,15 +326,15 @@ class GLPIClient:
         """Получить активные тикеты где пользователь — Requester, Assignee или Observer."""
         if not self.session_token:
             await self.init_session()
-        
+
         async def _fetch_by_role(field_id, role_name):
             """Запрос тикетов по роли пользователя"""
             return await _do_fetch(field_id, Config.GLPI_MY_ID, role_name)
-        
+
         async def _fetch_by_role_group(field_id, group_id, role_name):
             """Запрос тикетов по роли группы"""
             return await _do_fetch(field_id, group_id, role_name)
-        
+
         async def _do_fetch(field_id, value, role_name):
             """Общий запрос тикетов"""
             params = {
@@ -355,7 +355,7 @@ class GLPIClient:
                 "sort": "2",
                 "order": "DESC",
             }
-            
+
             try:
                 async with aiohttp.ClientSession() as session:
                     url = f"{Config.GLPI_URL}/apirest.php/search/Ticket"
@@ -369,7 +369,7 @@ class GLPIClient:
                                     status_val = int(item.get("12", 0))
                                 except (ValueError, TypeError):
                                     status_val = 0
-                                
+
                                 results.append({
                                     "id": item.get("2"),
                                     "title": item.get("1", "Без названия"),
@@ -388,22 +388,22 @@ class GLPIClient:
             except Exception as e:
                 logger.error(f"  {role_name} error: {e}")
                 return []
-        
+
         logger.info("Fetching tickets by role...")
-        
+
         # 3 separate requests for user roles
         tickets_requester = await _fetch_by_role(4, "Requester")
         tickets_assignee = await _fetch_by_role(5, "Assignee")
         tickets_observer = await _fetch_by_role(66, "Observer")
-        
+
         # Also fetch by group observer (field 65)
         all_tickets = tickets_requester + tickets_assignee + tickets_observer
-        
+
         group_ids = await self.get_user_groups()
         for gid in group_ids:
             group_tickets = await _fetch_by_role_group(65, gid, f"ObserverGroup-{gid}")
             all_tickets.extend(group_tickets)
-        
+
         # Merge and deduplicate by ID, filter out Closed (6)
         merged = {}
         for ticket in all_tickets:
@@ -412,15 +412,101 @@ class GLPIClient:
                 status = ticket.get("status", 0)
                 if status != 6:  # 6 = Closed
                     merged[tid] = ticket
-        
+
         # Sort by ID descending
         result = sorted(merged.values(), key=lambda x: int(x.get("id", 0)), reverse=True)
-        
-        # Resolve IDs to names for each ticket
-        # Search API does not return location (Field 83 is None), so we fetch from direct API
-        for ticket in result:
+
+        await self._resolve_ticket_extra_fields(result)
+
+        logger.info(f"Total unique active tickets: {len(result)}")
+        return result
+
+    async def get_all_active_tickets(self):
+        """Получить ВСЕ активные тикеты в системе (статусы 1-5, не закрытые).
+
+        В отличие от get_active_tickets(), не фильтрует по роли пользователя (Requester/
+        Assignee/Observer) — используется фоновым монитором (check_tickets), которому нужно
+        видеть новые/изменённые тикеты, даже если директор формально не участник (GLPI не
+        добавляет группу Administrators как observer автоматически). НЕ использовать для
+        /my_tickets — там нужен именно отфильтрованный по роли список (get_active_tickets).
+
+        Ловушка (реальный инцидент 2026-07-03/04): `criteria[searchtype]=notequals` на поле
+        12 (Status) в этой версии GLPI Search API работает НЕ как исключение — вместо "статус
+        != 6" он фактически вернул 398 тикетов СО СТАТУСОМ 6 (Closed) при totalcount=407, где
+        реально активных было только 9. `is_deleted` и range-пагинация тут ни при чём, баг
+        воспроизводится и одним запросом на весь диапазон. Единственный надёжный способ —
+        явный OR по `equals` для каждого активного статуса (1..5), как это уже делает
+        sysadmin-bot (`services/glpi.py: get_active_tickets`, "Fetched N active tickets
+        (statuses 1-5)"). НЕ возвращать `criteria[searchtype]=notequals` для этого поля.
+        """
+        if not self.session_token:
+            await self.init_session()
+
+        results = []
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{Config.GLPI_URL}/apirest.php/search/Ticket"
+                params = {
+                    "criteria[0][field]": 12,
+                    "criteria[0][searchtype]": "equals",
+                    "criteria[0][value]": 1,
+                    "forcedisplay[0]": 2,
+                    "forcedisplay[1]": 1,
+                    "forcedisplay[2]": 12,
+                    "forcedisplay[3]": 15,
+                    "forcedisplay[4]": 21,
+                    "forcedisplay[5]": 83,
+                    "forcedisplay[6]": 4,
+                    "forcedisplay[7]": 5,
+                    "range": "0-999",
+                    "sort": "2",
+                    "order": "DESC",
+                }
+                for i, st in enumerate([2, 3, 4, 5], start=1):
+                    params[f"criteria[{i}][link]"] = "OR"
+                    params[f"criteria[{i}][field]"] = 12
+                    params[f"criteria[{i}][searchtype]"] = "equals"
+                    params[f"criteria[{i}][value]"] = st
+                async with session.get(url, headers=self.get_headers(), params=params) as resp:
+                    if resp.status in [200, 206]:
+                        data = await resp.json()
+                        total = data.get("totalcount", 0)
+                        for item in data.get("data", []):
+                            try:
+                                status_val = int(item.get("12", 0))
+                            except (ValueError, TypeError):
+                                status_val = 0
+                            results.append({
+                                "id": item.get("2"),
+                                "title": item.get("1", "Без названия"),
+                                "status": status_val,
+                                "date": item.get("15", ""),
+                                "content": item.get("21", ""),
+                                "location_name": item.get("83", ""),
+                                "requester_name": item.get("4", ""),
+                                "technician_name": item.get("5", ""),
+                            })
+                        logger.info(f"  All active tickets: {len(results)} (statuses 1-5, total={total})")
+                    else:
+                        logger.warning(f"  All active tickets: HTTP {resp.status}")
+        except Exception as e:
+            logger.error(f"  All active tickets error: {e}")
+
+        await self._resolve_ticket_extra_fields(results)
+
+        logger.info(f"Total unique active tickets: {len(results)}")
+        return results
+
+    async def _resolve_ticket_extra_fields(self, tickets):
+        """Дозаполняет location/priority/date_creation/updater + имена requester/technician.
+
+        Search API не возвращает location/priority надёжно (Field 83 = None), поэтому
+        для каждого тикета делаем прямой GET /Ticket/{id}. Используется и
+        get_active_tickets(), и get_all_active_tickets() — общая логика, было продублировано.
+        """
+        for ticket in tickets:
             tid = ticket.get("id")
-            
+
             # Fetch extra fields from direct Ticket API (Search API returns None for location/priority)
             try:
                 async with aiohttp.ClientSession() as api_session:
@@ -447,7 +533,7 @@ class GLPIClient:
                 ticket["priority"] = 3
                 ticket["date_creation"] = ""
                 ticket["users_id_lastupdater"] = 0
-            
+
             # Requester ID -> Name (from Search API Field 4)
             req_id = ticket.get("requester_name")
             if req_id:
@@ -457,7 +543,7 @@ class GLPIClient:
                     ticket["requester_name"] = "Неизвестно"
             else:
                 ticket["requester_name"] = "Неизвестно"
-            
+
             # Technician ID -> Name (from Search API Field 5)
             tech_id = ticket.get("technician_name")
             if tech_id:
@@ -467,9 +553,6 @@ class GLPIClient:
                     ticket["technician_name"] = ""
             else:
                 ticket["technician_name"] = ""
-        
-        logger.info(f"Total unique active tickets: {len(result)}")
-        return result
 
     async def _get_entity_name(self, entity_id):
         """Получить название филиала по ID"""
@@ -610,16 +693,77 @@ class GLPIClient:
             logger.error(f"Error fetching followup for ticket {ticket_id}: {e}")
             return None
 
-    async def get_ticket_tasks(self, ticket_id):
-        """Получить все задачи (ITILTask) тикета"""
+    async def get_ticket_followups(self, ticket_id):
+        """Получить ВСЕ комментарии (ITILFollowup) тикета"""
         try:
             async with aiohttp.ClientSession() as session:
-                url = f"{Config.GLPI_URL}/apirest.php/Ticket/{ticket_id}/ITILTask"
+                url = f"{Config.GLPI_URL}/apirest.php/Ticket/{ticket_id}/ITILFollowup"
+                params = {"range": "0-99"}
+                async with session.get(url, headers=self.get_headers(), params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data and isinstance(data, list):
+                            result = []
+                            for fu in data:
+                                user_id = fu.get("users_id", 0)
+                                content = fu.get("content", "")
+                                date_creation = fu.get("date_creation", "")
+                                user_name = await self._get_user_name(user_id) if user_id else "GLPI"
+                                result.append({
+                                    "user_name": user_name,
+                                    "content": self.clean_html_to_text(content),
+                                    "date_creation": date_creation
+                                })
+                            return result
+            return []
+        except Exception as e:
+            logger.error(f"Error fetching followups for ticket {ticket_id}: {e}")
+            return []
+
+    async def get_ticket_solutions(self, ticket_id):
+        """Получить ВСЕ решения (ITILSolution) тикета"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{Config.GLPI_URL}/apirest.php/Ticket/{ticket_id}/ITILSolution"
+                params = {"range": "0-99"}
+                async with session.get(url, headers=self.get_headers(), params=params) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data and isinstance(data, list):
+                            result = []
+                            for sol in data:
+                                user_id = sol.get("users_id", 0)
+                                content = sol.get("content", "")
+                                date_creation = sol.get("date_creation", "")
+                                user_name = await self._get_user_name(user_id) if user_id else "Неизвестно"
+                                result.append({
+                                    "user_name": user_name,
+                                    "content": self.clean_html_to_text(content),
+                                    "date_creation": date_creation
+                                })
+                            return result
+            return []
+        except Exception as e:
+            logger.error(f"Error fetching solutions for ticket {ticket_id}: {e}")
+            return []
+
+    async def get_ticket_tasks(self, ticket_id):
+        """Получить все задачи (TicketTask) тикета.
+
+        Sub-resource is `TicketTask`, NOT `ITILTask` -- ITILTask is an abstract parent
+        class in GLPI's data model, not a valid REST endpoint (400
+        ERROR_RESOURCE_NOT_FOUND_NOR_COMMONDBTM). Status field on records is `state`,
+        not `status`.
+        """
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{Config.GLPI_URL}/apirest.php/Ticket/{ticket_id}/TicketTask"
                 params = {"range": "0-49"}
                 async with session.get(url, headers=self.get_headers(), params=params) as resp:
                     if resp.status == 200:
                         tasks = await resp.json()
                         return tasks if isinstance(tasks, list) else []
+                    logger.warning(f"Error fetching tasks for ticket {ticket_id}: HTTP {resp.status}")
             return []
         except Exception as e:
             logger.error(f"Error fetching tasks for ticket {ticket_id}: {e}")
@@ -1494,6 +1638,7 @@ async def check_validations(silent=True):
             try:
                 await bot.send_message(Config.ADMIN_ID, msg, parse_mode="HTML", reply_markup=kb)
                 logger.info(f"✅ Уведомление о согласовании отправлено директору (ID: {Config.ADMIN_ID})")
+                await asyncio.sleep(0.5)  # Telegram flood control
             except Exception as e:
                 logger.error(f"❌ Не удалось отправить уведомление директору: {e}")
 
@@ -1509,7 +1654,7 @@ async def check_validations(silent=True):
 async def check_tickets():
     """Проверка изменений в активных тикетах"""
     try:
-        tickets = await glpi.get_active_tickets()
+        tickets = await glpi.get_all_active_tickets()
         if not tickets:
             return 0
         
@@ -1607,6 +1752,7 @@ async def check_tickets():
                     try:
                         await bot.send_message(Config.ADMIN_ID, msg, parse_mode="HTML", reply_markup=kb)
                         logger.info(f"✅ Уведомление о новом тикете #{glpi_id} отправлено директору")
+                        await asyncio.sleep(0.5)  # Telegram flood control
                     except Exception as e:
                         logger.error(f"❌ Не удалось отправить уведомление о тикете #{glpi_id}: {e}")
 
@@ -1662,33 +1808,101 @@ async def check_tickets():
                         except Exception:
                             pass
 
-                        # Решение / комментарий
+                        # Решение / комментарий к смене статуса
                         solution_block = ""
+
+                        # Ищем followup/решение, добавленные вместе со сменой статуса (±2 мин от date_mod)
+                        # Окно нужно, т.к. между опросами могло произойти НЕСКОЛЬКО смен статуса подряд
+                        # (например 2→5 с решением, затем сразу 5→3 при отклонении решения) — бот видит
+                        # только итоговый переход, поэтому решение может лежать в ITILSolution, а не в
+                        # ITILFollowup, даже если итоговый статус не 5/6.
+                        date_mod = full_ticket.get('date_mod', '')
+                        mod_time = None
+                        window = timedelta(minutes=2)
+                        if date_mod:
+                            try:
+                                mod_time = datetime.strptime(date_mod, "%Y-%m-%d %H:%M:%S")
+                            except ValueError:
+                                mod_time = None
+
+                        all_followups = await glpi.get_ticket_followups(glpi_id)
+                        recent_followups = []
+                        if mod_time:
+                            for fu in all_followups:
+                                fu_date = fu.get('date_creation', '')
+                                if fu_date:
+                                    try:
+                                        fu_time = datetime.strptime(fu_date, "%Y-%m-%d %H:%M:%S")
+                                        if abs((fu_time - mod_time).total_seconds()) <= window.total_seconds():
+                                            recent_followups.append(fu)
+                                    except ValueError:
+                                        pass
+
+                        all_solutions = await glpi.get_ticket_solutions(glpi_id)
+                        recent_solutions = []
+                        if mod_time:
+                            for sol in all_solutions:
+                                sol_date = sol.get('date_creation', '')
+                                if sol_date:
+                                    try:
+                                        sol_time = datetime.strptime(sol_date, "%Y-%m-%d %H:%M:%S")
+                                        if abs((sol_time - mod_time).total_seconds()) <= window.total_seconds():
+                                            recent_solutions.append(sol)
+                                    except ValueError:
+                                        pass
+
                         if api_status in [5, 6]:
                             sol_data = await glpi._get_ticket_solution(glpi_id)
                             if sol_data and sol_data["content"]:
                                 sol_user = html.escape(sol_data["user_name"])
                                 solution_block = f"\n\n💡 <b>Решение ({sol_user}):</b>\n<i>{sol_data['content'][:500]}</i>"
+                            elif recent_followups:
+                                # Показываем ВСЕ комментарии, добавленные вместе со сменой статуса
+                                fu_lines = []
+                                for fu in recent_followups:
+                                    if fu.get('content'):
+                                        fu_user = html.escape(fu['user_name'])
+                                        fu_lines.append(f"• <i>{fu['content'][:500]}</i> ({fu_user})")
+                                if fu_lines:
+                                    label = "Комментарий" if len(fu_lines) == 1 else "Комментарии"
+                                    solution_block = f"\n\n💬 <b>{label}:</b>\n" + "\n".join(fu_lines)
                             else:
                                 fu_data = await glpi._get_ticket_followup(glpi_id)
                                 if fu_data and fu_data["content"]:
                                     fu_user = html.escape(fu_data["user_name"])
                                     solution_block = f"\n\n💬 <b>Комментарий ({fu_user}):</b>\n<i>{fu_data['content'][:500]}</i>"
                         else:
-                            fu_data = await glpi._get_ticket_followup(glpi_id)
-                            if fu_data and fu_data["content"]:
-                                fu_user = html.escape(fu_data["user_name"])
-                                solution_block = f"\n\n💬 <b>Комментарий ({fu_user}):</b>\n<i>{fu_data['content'][:500]}</i>"
+                            if recent_solutions:
+                                last_sol = max(recent_solutions, key=lambda x: x.get('date_creation', ''))
+                                if last_sol.get('content'):
+                                    sol_user = html.escape(last_sol['user_name'])
+                                    solution_block = f"\n\n💡 <b>Решение ({sol_user}):</b>\n<i>{last_sol['content'][:500]}</i>"
+                            elif recent_followups:
+                                # Показываем ВСЕ комментарии, добавленные вместе со сменой статуса
+                                fu_lines = []
+                                for fu in recent_followups:
+                                    if fu.get('content'):
+                                        fu_user = html.escape(fu['user_name'])
+                                        fu_lines.append(f"• <i>{fu['content'][:500]}</i> ({fu_user})")
+                                if fu_lines:
+                                    label = "Комментарий" if len(fu_lines) == 1 else "Комментарии"
+                                    solution_block = f"\n\n💬 <b>{label}:</b>\n" + "\n".join(fu_lines)
+                            else:
+                                fu_data = await glpi._get_ticket_followup(glpi_id)
+                                if fu_data and fu_data["content"]:
+                                    fu_user = html.escape(fu_data["user_name"])
+                                    solution_block = f"\n\n💬 <b>Комментарий ({fu_user}):</b>\n<i>{fu_data['content'][:500]}</i>"
 
                         # Задачи (ITILTask)
-                        TASK_STATUS = {1: '⬜', 2: '🔄', 3: '✅', 4: '⏳', 5: '❌'}
+                        # GLPI Planning class constants (inc/planning.class.php): только 3 значения, не 5!
+                        TASK_STATUS = {0: 'ℹ️', 1: '⬜', 2: '✅'}
                         tasks_block = ""
                         try:
                             tasks = await glpi.get_ticket_tasks(glpi_id)
                             if tasks:
                                 task_lines = []
                                 for t in tasks:
-                                    t_status = int(t.get('status', 0))
+                                    t_status = int(t.get('state', 0))
                                     t_emoji = TASK_STATUS.get(t_status, '❓')
                                     t_text = glpi.clean_html_to_text(t.get('content', ''))
                                     if len(t_text) > 100:
@@ -1753,6 +1967,7 @@ async def check_tickets():
                         try:
                             await bot.send_message(Config.ADMIN_ID, msg, parse_mode="HTML", reply_markup=kb)
                             logger.info(f"✅ Уведомление об изменении статуса тикета #{glpi_id} отправлено директору")
+                            await asyncio.sleep(0.5)  # Telegram flood control
                         except Exception as e:
                             logger.error(f"❌ Не удалось отправить уведомление об изменении тикета #{glpi_id}: {e}")
 
